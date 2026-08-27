@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PR Watcher",
+  "version": "0.1.0",
+  "identifier": "com.prwatcher.v0",
+  "build": { "frontendDist": "../dist" },
+  "app": { "windows": [{ "title": "PR Watcher", "width": 980, "height": 720 }], "security": { "csp": null } },
+  "bundle": { "active": false, "icon": [] }
+}
