@@ -1,0 +1,28 @@
+{
+  "provider": "buildkite",
+  "captured_shape": true,
+  "captured_at": "2026-09-08",
+  "scrubbed": true,
+  "request_paths": {
+    "build": "/v2/organizations/acme/pipelines/widgets/builds/42",
+    "access_probe": "/v2/user"
+  },
+  "fixture_mapping": {
+    "success": "build-success.json",
+    "credential_rejected": "auth-rejected.json",
+    "rate_limited": "rate-limited.json",
+    "missing_build_field": "missing-state.json",
+    "missing_job_field": "missing-job-id.json",
+    "unknown_build_state": "unknown-build-state.json",
+    "unknown_job_state": "unknown-job-state.json"
+  },
+  "cases": [
+    {"file": "build-success.json", "http_status": 200, "purpose": "completed build and terminal jobs"},
+    {"file": "auth-rejected.json", "http_status": 401, "purpose": "redacted credential rejection"},
+    {"file": "rate-limited.json", "http_status": 429, "headers": {"retry-after": "1"}, "purpose": "bounded retry"},
+    {"file": "missing-state.json", "http_status": 200, "purpose": "required build field missing"},
+    {"file": "missing-job-id.json", "http_status": 200, "purpose": "required job field missing"},
+    {"file": "unknown-build-state.json", "http_status": 200, "purpose": "unknown build state"},
+    {"file": "unknown-job-state.json", "http_status": 200, "purpose": "unknown job state"}
+  ]
+}

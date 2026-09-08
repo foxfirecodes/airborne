@@ -1,0 +1,9 @@
+{
+  "state": "passed",
+  "finished_at": "2026-09-08T12:03:00.000Z",
+  "web_url": "https://buildkite.com/acme/widgets/builds/42",
+  "jobs": [
+    {"id": "job-1", "name": "test", "state": "passed", "finished_at": "2026-09-08T12:02:00.000Z", "web_url": "https://buildkite.com/acme/widgets/builds/42#job-1"},
+    {"id": "job-2", "name": "lint", "state": "passed", "finished_at": "2026-09-08T12:03:00.000Z", "web_url": "https://buildkite.com/acme/widgets/builds/42#job-2"}
+  ]
+}

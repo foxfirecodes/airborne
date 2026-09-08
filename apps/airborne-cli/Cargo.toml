@@ -1,0 +1,35 @@
+[package]
+name = "airborne-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "airborne"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+airborne-buildkite = { path = "../../crates/airborne-buildkite" }
+airborne-core = { path = "../../crates/airborne-core" }
+airborne-credentials-macos = { path = "../../crates/airborne-credentials-macos" }
+airborne-github = { path = "../../crates/airborne-github" }
+airborne-pr = { path = "../../crates/airborne-pr" }
+airborne-runtime = { path = "../../crates/airborne-runtime" }
+airborne-store-sqlite = { path = "../../crates/airborne-store-sqlite" }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

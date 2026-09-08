@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/airborne-cli",
+  "crates/airborne-buildkite",
+  "crates/airborne-core",
+  "crates/airborne-credentials-macos",
+  "crates/airborne-github",
+  "crates/airborne-pr",
+  "crates/airborne-runtime",
+  "crates/airborne-store-sqlite",
+]
+exclude = ["src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
