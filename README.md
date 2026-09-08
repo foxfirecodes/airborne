@@ -1,5 +1,9 @@
 # PR Watcher
 
+> This repository currently contains the desktop prototype. Airborne is moving
+> to a CLI; [`docs/cli/`](docs/cli/README.md) is the authoritative specification
+> for new work.
+
 PR Watcher is a local macOS menubar app for GitHub pull requests. It watches
 the current head SHA and alerts when Cursor Bugbot or selected Buildkite jobs
 finish.
