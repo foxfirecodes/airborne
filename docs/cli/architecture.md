@@ -368,9 +368,22 @@ Secret values must use a type whose debug and display forms redact content.
 Provider clients receive secrets at composition time and must not expose them
 through their error types.
 
-Environment variable lookup belongs in the CLI composition layer. It wraps the
-Keychain store with this precedence: environment, then Keychain. Tests use an
-in-memory credential store or environment wrapper; they do not call Keychain.
+Credential composition belongs in the CLI layer. Release builds use a nonempty
+process environment value before Keychain and never load `.env`. Debug builds
+use a nonempty process value first, then `./.env` in the process working
+directory; they never read Keychain for normal credential resolution, status,
+or doctor. An empty process value may be filled by a nonempty `.env` value.
+Otherwise it is missing, never a reason to fall back. A missing `.env` is valid;
+duplicate credential keys, or an existing malformed or unreadable file, fail
+safely only when a provider needs resolution from `.env`; a nonempty process
+value for that provider skips the file. Status and doctor retain whether a
+debug value came from the process environment or `.env`. A release Keychain
+read error propagates as a safe error, never as a missing credential.
+
+Keychain operations remain explicit: `auth set`, `auth remove`, and
+`migrate prototype --credentials` call the Keychain store in both build modes.
+Tests use an in-memory credential store or a controlled `.env`; they do not call
+Keychain.
 
 ### 4.8 `airborne-cli`
 

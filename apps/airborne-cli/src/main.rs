@@ -7,7 +7,9 @@
 )]
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode},
@@ -21,9 +23,11 @@ use airborne_core::{
     GitHubStatusContext, RuleConfig, RuleId, Subject, SubjectKey, SubjectKind, Timestamp, WatchId,
     WatchState,
 };
+#[cfg(not(debug_assertions))]
+use airborne_credentials_macos::CredentialPresence;
 use airborne_credentials_macos::{
-    CredentialError, CredentialPresence, CredentialStore, ExposeSecret, MacosCredentialStore,
-    ProviderCredential, SecretString,
+    CredentialError, CredentialStore, ExposeSecret, MacosCredentialStore, ProviderCredential,
+    SecretString,
 };
 use airborne_github::{parse_pull_request_url, GitHubApi, ReqwestGitHubApi};
 use airborne_pr::GitHubPullRequestMonitor;
@@ -34,7 +38,7 @@ use airborne_runtime::{
 use airborne_store_sqlite::{
     AlertRepository, CatalogRepository, NewRule, NewWatch, RuleChange, SqliteStore,
 };
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
@@ -120,13 +124,17 @@ enum WatchSub {
         all: bool,
     },
     /// Show one watch.
-    Show { watch_id: String },
+    Show {
+        #[arg(value_name = "WATCH_ID_OR_GITHUB_PR_URL")]
+        watch_id: String,
+    },
     /// Pause a watch.
     Pause { watch_id: String },
     /// Resume a watch and reset its rule baselines.
     Resume { watch_id: String },
     /// Archive a watch.
     Remove {
+        #[arg(value_name = "WATCH_ID_OR_GITHUB_PR_URL")]
         watch_id: String,
         #[arg(long)]
         yes: bool,
@@ -406,6 +414,7 @@ impl Error {
 struct Out {
     json: bool,
     quiet: bool,
+    color: bool,
 }
 struct EchoGuard;
 impl EchoGuard {
@@ -434,40 +443,19 @@ impl Out {
                 json!({"schema_version":1,"command":command,"outcome":"success","data":data})
             );
         } else if !self.quiet {
-            println!("{}", human(command, &data));
+            println!("{}", human(command, &data, self.color));
         }
         Ok(())
     }
 }
-fn human(command: &str, data: &Value) -> String {
+fn human(command: &str, data: &Value, color: bool) -> String {
     match command {
-        "watch.list" => rows(data, "watches", |item| {
-            format!("{}\t{}\t{}", item["id"], item["state"], item["subject_key"])
-        }),
-        "rule.list" => rows(data, "rules", |item| {
-            format!(
-                "{}\t{}\t{}",
-                item["id"],
-                item["kind"],
-                if item["enabled"].as_bool().unwrap_or(false) {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            )
-        }),
-        "alerts.list" => rows(data, "alerts", |item| {
-            format!(
-                "{}\t{}\t{}",
-                item["id"],
-                item["title"].as_str().unwrap_or(""),
-                if item["acknowledged_at"].is_null() {
-                    "pending"
-                } else {
-                    "acknowledged"
-                }
-            )
-        }),
+        "watch.list" => render_watch_list(data, color),
+        "watch.show" => render_watch_show(data, color),
+        "rule.list" => render_rule_list(data, color),
+        "rule.show" => render_rule_show(data, color),
+        "alerts.list" => render_alert_list(data, color),
+        "alerts.show" => render_alert_show(data, color),
         "refresh" | "run" => format!(
             "{}: {} watch(es), {} new alert(s), {} issue(s)",
             data["outcome"].as_str().unwrap_or("completed"),
@@ -487,64 +475,591 @@ fn human(command: &str, data: &Value) -> String {
                     .sum::<usize>())
                 .unwrap_or(0)
         ),
-        "status" => rows(data, "watches", |item| {
-            let watch = format!(
-                "{}\t{}\t{} rule(s)",
-                item["watch"]["id"],
-                item["subject"]["current_revision"]
-                    .as_str()
-                    .unwrap_or("unknown"),
-                item["rules"].as_array().map_or(0, Vec::len)
-            );
-            let rules = item["rules"].as_array().map_or_else(Vec::new, |rules| {
-                rules
-                    .iter()
-                    .map(|rule| {
-                        let observation = &rule["latest_observation"];
-                        let state = observation["state"]
-                            .as_str()
-                            .map(human_candidate_state)
-                            .unwrap_or("no observation");
-                        let observed = observation["observed_at"].as_str().unwrap_or("never");
-                        let policy = &rule["alert_policy"];
-                        let start = if policy["alert_on_start"].as_bool() == Some(true) {
-                            "start"
-                        } else {
-                            "no-start"
-                        };
-                        let missing = policy["alert_if_missing_after_seconds"]
-                            .as_u64()
-                            .map_or_else(
-                                || "no-missing".to_owned(),
-                                |seconds| format!("missing-after={seconds}s"),
-                            );
-                        format!(
-                            "  {}\t{state}\tlast observed {observed}\t{start}, {missing}",
-                            rule["rule"]["id"]
-                        )
-                    })
-                    .collect()
-            });
-            if rules.is_empty() {
-                watch
-            } else {
-                format!("{watch}\n{}", rules.join("\n"))
-            }
-        }),
+        "status" => render_status(data, color),
         _ => serde_json::to_string_pretty(data).unwrap_or_else(|_| "completed".into()),
     }
 }
-fn rows(data: &Value, key: &str, render: impl Fn(&Value) -> String) -> String {
-    data[key]
-        .as_array()
-        .map(|items| {
-            if items.is_empty() {
-                "No results.".into()
-            } else {
-                items.iter().map(render).collect::<Vec<_>>().join("\n")
-            }
+fn style(value: impl AsRef<str>, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{}\x1b[0m", value.as_ref())
+    } else {
+        value.as_ref().to_owned()
+    }
+}
+fn bold(value: impl AsRef<str>, color: bool) -> String {
+    style(value, "1", color)
+}
+fn dim(value: impl AsRef<str>, color: bool) -> String {
+    style(value, "2", color)
+}
+fn state(value: &str, color: bool) -> String {
+    let normalized = value.to_ascii_lowercase();
+    let code = match normalized.as_str() {
+        "active" | "enabled" | "completed" | "passed" | "success" | "terminal" => "32",
+        "paused" | "pending" | "waiting" | "in progress" | "in_progress" | "acknowledged"
+        | "started" => "33",
+        "failed" | "unavailable" | "missing" | "not detected" | "not_detected" => "31",
+        _ => "2",
+    };
+    style(value.replace('_', " "), code, color)
+}
+fn text<'a>(value: &'a Value, key: &str) -> &'a str {
+    value[key].as_str().unwrap_or("")
+}
+fn id(value: &Value) -> String {
+    let value = value.as_str().unwrap_or("unknown");
+    let end = value.char_indices().nth(12).map_or(value.len(), |(i, _)| i);
+    format!(
+        "{}{}",
+        &value[..end],
+        if end < value.len() { "…" } else { "" }
+    )
+}
+fn timestamp(value: &Value) -> String {
+    value
+        .as_str()
+        .and_then(|x| DateTime::parse_from_rfc3339(x).ok())
+        .map(|x| {
+            x.with_timezone(&Local)
+                .format("%b %-d, %Y at %-I:%M %p %Z")
+                .to_string()
         })
-        .unwrap_or_else(|| "completed".into())
+        .unwrap_or_else(|| "never".into())
+}
+fn pr(subject: &Value) -> String {
+    let url = text(subject, "canonical_url");
+    let key = text(subject, "key")
+        .strip_prefix("github.com/")
+        .unwrap_or(text(subject, "key"));
+    let key = key.strip_prefix("https://github.com/").unwrap_or(key);
+    let key = key.strip_prefix("github.com/").unwrap_or(key);
+    let key = key.replace("/pull/", " #");
+    let key = if key.is_empty() {
+        url.trim_start_matches("https://github.com/")
+            .replace("/pull/", " #")
+    } else {
+        key
+    };
+    let title = text(subject, "display_title");
+    if title.is_empty() {
+        key
+    } else {
+        format!("{key} — {title}")
+    }
+}
+fn rule_name(rule: &Value) -> String {
+    let config = &rule["definition"]["config"];
+    match text(config, "kind") {
+        "git_hub_check_completes" => text(config, "check_name").to_owned(),
+        "buildkite_job_completes" => format!("Buildkite · {}", text(config, "job_name")),
+        _ => text(
+            rule["rule"].as_object().map_or(rule, |_| &rule["rule"]),
+            "kind",
+        )
+        .replace('_', " "),
+    }
+}
+fn observation_state(rule: &Value) -> String {
+    rule["latest_observation"]["state"].as_str().map_or_else(
+        || "no observation".into(),
+        |x| human_candidate_state(x).to_owned(),
+    )
+}
+fn rule_entity(rule: &Value) -> &Value {
+    rule["rule"].as_object().map_or(rule, |_| &rule["rule"])
+}
+fn rule_display_state(rule: &Value) -> String {
+    let entity = rule_entity(rule);
+    if !entity["archived_at"].is_null() {
+        "archived".into()
+    } else if entity["enabled"].as_bool() == Some(false) {
+        "disabled".into()
+    } else {
+        observation_state(rule)
+    }
+}
+fn missing_for(observation: &Value) -> Option<String> {
+    let first = observation["first_observed_at"].as_str()?;
+    let first = DateTime::parse_from_rfc3339(first)
+        .ok()?
+        .with_timezone(&Utc);
+    let elapsed = u64::try_from(Utc::now().signed_duration_since(first).num_seconds()).unwrap_or(0);
+    Some(format!("missing for {}", duration(elapsed)))
+}
+fn event_label(event: &str) -> String {
+    let event = event.replace('_', " ");
+    let mut chars = event.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + chars.as_str()
+    })
+}
+fn plural(count: u64, singular: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
+}
+fn policy(rule: &Value) -> Option<String> {
+    let c = &rule["definition"]["config"];
+    if text(c, "kind") != "git_hub_check_completes" {
+        return Some("Alert on terminal result".into());
+    }
+    let mut values = Vec::new();
+    if c["alert_on_start"].as_bool() == Some(true) {
+        values.push("Alert when started".into());
+    }
+    if let Some(seconds) = c["alert_if_missing_after_seconds"].as_u64() {
+        values.push(format!("alert if missing after {}", duration(seconds)));
+    }
+    values.push("Alert when completed".into());
+    Some(values.join("  ·  "))
+}
+fn duration(seconds: u64) -> String {
+    if seconds % 3600 == 0 {
+        plural(seconds / 3600, "hour")
+    } else if seconds % 60 == 0 {
+        plural(seconds / 60, "minute")
+    } else {
+        plural(seconds, "second")
+    }
+}
+fn render_status(data: &Value, color: bool) -> String {
+    let watches = data["watches"].as_array().cloned().unwrap_or_default();
+    if watches.is_empty() {
+        return format!("{}\nNo watches.", bold("Airborne status", color));
+    }
+    let pending: u64 = watches
+        .iter()
+        .map(|x| x["pending_alert_count"].as_u64().unwrap_or(0))
+        .sum();
+    let mut out = vec![
+        bold("Airborne status", color),
+        format!(
+            "{}  ·  {}",
+            plural(watches.len() as u64, "watch"),
+            plural(pending, "pending alert")
+        ),
+    ];
+    for watch in watches {
+        let w = &watch["watch"];
+        out.push(format!(
+            "\n{}  {}",
+            bold(pr(&watch["subject"]), color),
+            state(text(w, "state"), color)
+        ));
+        for rule in watch["rules"].as_array().into_iter().flatten() {
+            out.push(format!(
+                "  {}  {}",
+                rule_name(rule),
+                state(&rule_display_state(rule), color)
+            ));
+            if !rule["latest_observation"]["observed_at"].is_null() {
+                out.push(format!(
+                    "    {}",
+                    dim(
+                        format!(
+                            "observed {}",
+                            timestamp(&rule["latest_observation"]["observed_at"])
+                        ),
+                        color
+                    )
+                ));
+            }
+            if let Some(issue) = rule["latest_issue"].as_object() {
+                out.push(format!(
+                    "    {}",
+                    style(
+                        format!(
+                            "Issue: {}",
+                            issue
+                                .get("safe_message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown source error")
+                        ),
+                        "31",
+                        color
+                    )
+                ));
+            }
+        }
+        if watch["pending_alert_count"].as_u64().unwrap_or(0) > 0 {
+            out.push(format!(
+                "  {}",
+                state(
+                    &plural(
+                        watch["pending_alert_count"].as_u64().unwrap_or(0),
+                        "pending alert"
+                    ),
+                    color
+                )
+            ));
+        }
+        if let Some(issue) = watch["latest_issue"].as_object() {
+            out.push(format!(
+                "  {}",
+                style(
+                    format!(
+                        "Issue: {}",
+                        issue
+                            .get("safe_message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown source error")
+                    ),
+                    "31",
+                    color
+                )
+            ));
+        }
+        if !watch["subject"]["current_revision"].is_null() {
+            out.push(format!(
+                "  {}",
+                dim(
+                    format!("Revision {}", text(&watch["subject"], "current_revision")),
+                    color
+                )
+            ));
+        }
+        if let Some(checked) = watch["latest_poll_finished_at"].as_str() {
+            let outcome = watch["latest_poll_outcome"].as_str().unwrap_or("unknown");
+            out.push(format!(
+                "  {}",
+                dim(
+                    format!(
+                        "Checked {}  ·  last poll {outcome}",
+                        timestamp(&Value::String(checked.into()))
+                    ),
+                    color
+                )
+            ));
+        }
+        out.push(format!(
+            "  {}",
+            dim(
+                format!(
+                    "{}  ·  {}",
+                    id(&w["id"]),
+                    text(&watch["subject"], "canonical_url")
+                ),
+                color
+            )
+        ));
+    }
+    out.join("\n")
+}
+fn render_watch_list(data: &Value, color: bool) -> String {
+    let watches = data["watches"].as_array().cloned().unwrap_or_default();
+    if watches.is_empty() {
+        return format!("{}\nNo watches.", bold("Watches", color));
+    }
+    let active = watches
+        .iter()
+        .filter(|x| text(x, "state") == "active")
+        .count();
+    let paused = watches
+        .iter()
+        .filter(|x| text(x, "state") == "paused")
+        .count();
+    let mut out = vec![
+        bold("Watches", color),
+        format!(
+            "{} total  ·  {} active  ·  {} paused",
+            watches.len(),
+            active,
+            paused
+        ),
+    ];
+    for w in watches {
+        out.push(format!(
+            "\n{}  {}",
+            bold(pr(&w["subject"]), color),
+            state(text(&w, "state"), color)
+        ));
+        let mut detail = plural(w["active_rule_count"].as_u64().unwrap_or(0), "rule");
+        if w["pending_alert_count"].as_u64().unwrap_or(0) > 0 {
+            write!(
+                detail,
+                "  ·  {}",
+                plural(
+                    w["pending_alert_count"].as_u64().unwrap_or(0),
+                    "pending alert"
+                )
+            )
+            .expect("write to string");
+        }
+        if !w["latest_poll"]["finished_at"].is_null() {
+            write!(
+                detail,
+                "  ·  {}",
+                dim(
+                    format!("checked {}", timestamp(&w["latest_poll"]["finished_at"])),
+                    color
+                )
+            )
+            .expect("write to string");
+        }
+        out.push(format!("  {detail}"));
+        out.push(format!(
+            "  {}",
+            dim(text(&w["subject"], "canonical_url"), color)
+        ));
+        out.push(format!("  {}", dim(id(&w["id"]), color)));
+    }
+    out.join("\n")
+}
+fn render_watch_show(w: &Value, color: bool) -> String {
+    let mut out = vec![
+        format!(
+            "{}  {}",
+            bold(pr(&w["subject"]), color),
+            state(text(w, "state"), color)
+        ),
+        String::new(),
+        format!(
+            "Pull request   {}",
+            dim(text(&w["subject"], "canonical_url"), color)
+        ),
+        format!(
+            "Revision       {}",
+            dim(text(&w["subject"], "current_revision"), color)
+        ),
+    ];
+    if !w["latest_poll"]["finished_at"].is_null() {
+        out.push(format!(
+            "Last checked   {}",
+            dim(timestamp(&w["latest_poll"]["finished_at"]), color)
+        ));
+    }
+    out.push(format!("\n{}", bold("Rules", color)));
+    let rules = w["rules"].as_array().cloned().unwrap_or_default();
+    if rules.is_empty() {
+        out.push("  No rules.".into());
+    }
+    for r in rules {
+        out.push(format!(
+            "  {}  {}",
+            bold(rule_name(&r), color),
+            state(&rule_display_state(&r), color)
+        ));
+        if let Some(p) = policy(&r) {
+            out.push(format!("    {p}"));
+        }
+    }
+    out.push(format!("\n{}", bold("Alerts", color)));
+    let alerts = w["pending_alerts"].as_array().cloned().unwrap_or_default();
+    if alerts.is_empty() {
+        out.push("  No pending alerts".into());
+    } else {
+        for a in alerts {
+            out.push(format!("  {}", bold(text(&a, "title"), color)));
+        }
+    }
+    out.push(format!("\n{}", dim(id(&w["id"]), color)));
+    out.join("\n")
+}
+fn render_rule_list(data: &Value, color: bool) -> String {
+    let rules = data["rules"].as_array().cloned().unwrap_or_default();
+    if rules.is_empty() {
+        return format!("{}\nNo rules.", bold("Rules", color));
+    }
+    let enabled = rules
+        .iter()
+        .filter(|x| x["enabled"].as_bool() == Some(true))
+        .count();
+    let mut out = vec![
+        bold("Rules", color),
+        format!("{} total  ·  {} enabled", rules.len(), enabled),
+    ];
+    for r in rules {
+        let enabled = if !r["archived_at"].is_null() {
+            "archived"
+        } else if r["enabled"].as_bool() == Some(true) {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        out.push(format!(
+            "\n{}  {}",
+            bold(rule_name(&r), color),
+            state(enabled, color)
+        ));
+        out.push(format!("  {}", bold(pr(&r["subject"]), color)));
+        let observed = &r["latest_observation"];
+        let mut line = state(&rule_display_state(&r), color);
+        if rule_display_state(&r) == "not detected" {
+            if let Some(elapsed) = missing_for(observed) {
+                write!(line, "  ·  {elapsed}").expect("write to string");
+            }
+        }
+        if !observed["observed_at"].is_null() {
+            write!(
+                line,
+                "  ·  {}",
+                dim(
+                    format!("checked {}", timestamp(&observed["observed_at"])),
+                    color
+                )
+            )
+            .expect("write to string");
+        }
+        out.push(format!("  {line}"));
+        out.push(format!("  {}", dim(id(&r["id"]), color)));
+    }
+    out.join("\n")
+}
+fn render_rule_show(r: &Value, color: bool) -> String {
+    let enabled = if !r["archived_at"].is_null() {
+        "archived"
+    } else if r["enabled"].as_bool() == Some(true) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let check = rule_name(r);
+    let observed = &r["latest_observation"];
+    let mut out = vec![
+        format!("{}  {}", bold(&check, color), state(enabled, color)),
+        bold(pr(&r["subject"]), color),
+        String::new(),
+    ];
+    let config = &r["definition"]["config"];
+    if text(config, "kind") == "git_hub_check_completes" {
+        out.push(format!("Check name       {check}"));
+    } else {
+        out.push(format!("Job              {}", text(config, "job_name")));
+        out.push(format!(
+            "Context          {}",
+            text(config, "github_status_context")
+        ));
+        out.push(format!(
+            "Organization     {}",
+            text(config, "expected_organization")
+        ));
+        out.push(format!(
+            "Pipeline         {}",
+            text(config, "expected_pipeline")
+        ));
+    }
+    out.extend([
+        format!("Current state    {}", state(&rule_display_state(r), color)),
+        format!(
+            "Last observed    {}",
+            dim(timestamp(&observed["observed_at"]), color)
+        ),
+        format!(
+            "Revision         {}",
+            dim(text(observed, "revision"), color)
+        ),
+        format!("\n{}", bold("Alerts", color)),
+    ]);
+    if let Some(p) = policy(r) {
+        for p in p.split("  ·  ") {
+            let p = p
+                .strip_prefix("Alert when ")
+                .map_or_else(|| p.to_owned(), |value| format!("When {value}"));
+            let p = if let Some(value) = p.strip_prefix("alert if ") {
+                format!("If {value}")
+            } else {
+                p
+            };
+            out.push(format!("  {p}"));
+        }
+    }
+    out.push(format!(
+        "\n{}",
+        dim(
+            format!(
+                "{}  ·  version {}",
+                id(&r["id"]),
+                r["current_version"].as_u64().unwrap_or(0)
+            ),
+            color
+        )
+    ));
+    out.join("\n")
+}
+fn render_alert_list(data: &Value, color: bool) -> String {
+    let alerts = data["alerts"].as_array().cloned().unwrap_or_default();
+    let all = text(data, "mode") == "all";
+    let heading = if all { "Alerts" } else { "Pending alerts" };
+    if alerts.is_empty() {
+        return format!(
+            "{}\n{}",
+            bold(heading, color),
+            if all {
+                "No alerts."
+            } else {
+                "No pending alerts."
+            }
+        );
+    }
+    let mut out = vec![bold(heading, color), plural(alerts.len() as u64, "alert")];
+    for a in alerts {
+        let status = if a["acknowledged_at"].is_null() {
+            "pending"
+        } else {
+            "acknowledged"
+        };
+        out.push(format!(
+            "\n{}  {}",
+            bold(text(&a, "title"), color),
+            state(status, color)
+        ));
+        out.push(format!("  {}", bold(pr(&a["subject"]), color)));
+        let detail = if text(&a["key"], "event_kind") == "missing" {
+            missing_for(&a["observation"]).unwrap_or_else(|| text(&a, "body").to_owned())
+        } else {
+            text(&a, "body").to_owned()
+        };
+        out.push(format!(
+            "  {}  ·  {}",
+            detail,
+            dim(timestamp(&a["created_at"]), color)
+        ));
+        out.push(format!("  {}", dim(id(&a["id"]), color)));
+    }
+    out.join("\n")
+}
+fn render_alert_show(a: &Value, color: bool) -> String {
+    let status = if a["acknowledged_at"].is_null() {
+        "pending"
+    } else {
+        "acknowledged"
+    };
+    let event = text(&a["key"], "event_kind");
+    let mut out = vec![
+        format!(
+            "{}  {}",
+            bold(text(a, "title"), color),
+            state(status, color)
+        ),
+        String::new(),
+        format!("Pull request    {}", bold(pr(&a["subject"]), color)),
+        format!("Rule            {}", rule_name(a)),
+        format!("Event           {}", state(&event_label(event), color)),
+        format!(
+            "Detected        {}",
+            dim(timestamp(&a["created_at"]), color)
+        ),
+        format!(
+            "Revision        {}",
+            dim(text(&a["key"], "revision"), color)
+        ),
+        String::new(),
+        text(a, "body").to_owned(),
+        String::new(),
+    ];
+    if a["source_url"].is_null() {
+        out.push(dim(text(&a["subject"], "canonical_url"), color));
+    } else {
+        out.push(dim(text(&a["subject"], "canonical_url"), color));
+        out.push(format!(
+            "Source          {}",
+            dim(text(a, "source_url"), color)
+        ));
+    }
+    out.push(dim(id(&a["id"]), color));
+    out.join("\n")
 }
 
 #[tokio::main]
@@ -616,6 +1131,10 @@ async fn execute(cli: Cli) -> Result<(), Error> {
     let out = Out {
         json: cli.json,
         quiet: cli.quiet,
+        color: !cli.json
+            && !cli.no_color
+            && env::var_os("NO_COLOR").is_none()
+            && io::stdout().is_terminal(),
     };
     match cli.command {
         Command::Watch(x) => watch(x.command, &store, &out).await,
@@ -671,18 +1190,178 @@ fn now() -> Timestamp {
 fn watch_id(value: String) -> Result<WatchId, Error> {
     WatchId::new(value).map_err(|e| Error::input(e.to_string()))
 }
+fn resolve_watch_reference(store: &SqliteStore, value: &str) -> Result<WatchId, Error> {
+    if value.starts_with("https://") {
+        let pull_request = parse_pull_request_url(value).map_err(|_| {
+            Error::input("expected a watch ID or canonical HTTPS GitHub pull request URL")
+        })?;
+        let subject_key = format!(
+            "github.com/{}/{}/pull/{}",
+            pull_request.repository.owner, pull_request.repository.repository, pull_request.number
+        );
+        return store
+            .list_watch_views(None)
+            .map_err(|error| Error::fail(error.to_string()))?
+            .into_iter()
+            .find(|watch| watch.subject.key.as_str() == subject_key)
+            .map(|watch| watch.watch.id)
+            .ok_or_else(|| Error::fail("watch was not found"));
+    }
+    watch_id(value.to_owned())
+}
 fn rule_id(value: String) -> Result<RuleId, Error> {
     RuleId::new(value).map_err(|e| Error::input(e.to_string()))
 }
+
+#[derive(Clone, Copy)]
+enum CredentialSource {
+    Environment,
+    #[cfg(debug_assertions)]
+    Dotenv,
+    #[cfg(not(debug_assertions))]
+    Keychain,
+    Missing,
+}
+impl CredentialSource {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            #[cfg(debug_assertions)]
+            Self::Dotenv => ".env",
+            #[cfg(not(debug_assertions))]
+            Self::Keychain => "keychain",
+            Self::Missing => "missing",
+        }
+    }
+}
+struct CredentialResolution {
+    secret: Option<SecretString>,
+    source: CredentialSource,
+}
+
 fn need(provider: ProviderCredential) -> Result<SecretString, Error> {
-    let name = match provider {
+    let resolution = resolve_credential(provider)?;
+    if let Some(value) = resolution.secret {
+        return Ok(value);
+    }
+    #[cfg(debug_assertions)]
+    return Err(Error {
+        code: CREDENTIAL,
+        message: format!(
+            "{} credential is missing from the environment or .env",
+            provider.account_name()
+        ),
+    });
+    #[cfg(not(debug_assertions))]
+    MacosCredentialStore.get(provider).map_err(credential_error)
+}
+
+fn process_credential(provider: ProviderCredential) -> Option<SecretString> {
+    env::var_os(credential_environment_name(provider))
+        .filter(|value| !value.is_empty())
+        .map(|value| SecretString::from(value.to_string_lossy().into_owned()))
+}
+
+/// Debug builds read shell credentials and the exact `./.env` path; they never consult Keychain.
+#[cfg(debug_assertions)]
+fn resolve_credential(provider: ProviderCredential) -> Result<CredentialResolution, Error> {
+    if let Some(secret) = process_credential(provider) {
+        return Ok(CredentialResolution {
+            secret: Some(secret),
+            source: CredentialSource::Environment,
+        });
+    }
+    let dotenv = dotenv_credentials()?;
+    let secret = match provider {
+        ProviderCredential::GitHub => dotenv.github,
+        ProviderCredential::Buildkite => dotenv.buildkite,
+    };
+    Ok(CredentialResolution {
+        source: if secret.is_some() {
+            CredentialSource::Dotenv
+        } else {
+            CredentialSource::Missing
+        },
+        secret,
+    })
+}
+
+#[cfg(debug_assertions)]
+struct DotenvCredentials {
+    github: Option<SecretString>,
+    buildkite: Option<SecretString>,
+}
+
+#[cfg(debug_assertions)]
+fn dotenv_credentials() -> Result<DotenvCredentials, Error> {
+    let entries = match dotenvy::from_path_iter(".env") {
+        Ok(entries) => entries,
+        Err(error) if error.not_found() => {
+            return Ok(DotenvCredentials {
+                github: None,
+                buildkite: None,
+            });
+        }
+        Err(_) => return Err(Error::fail("could not read .env credentials")),
+    };
+    let mut github = None;
+    let mut buildkite = None;
+    let mut saw_github = false;
+    let mut saw_buildkite = false;
+    for entry in entries {
+        let (key, candidate) =
+            entry.map_err(|_| Error::fail("could not parse .env credentials"))?;
+        match key.as_str() {
+            "AIRBORNE_GITHUB_TOKEN" => {
+                if saw_github {
+                    return Err(Error::fail("invalid .env credential configuration"));
+                }
+                saw_github = true;
+                if !candidate.is_empty() {
+                    github = Some(SecretString::from(candidate));
+                }
+            }
+            "AIRBORNE_BUILDKITE_TOKEN" => {
+                if saw_buildkite {
+                    return Err(Error::fail("invalid .env credential configuration"));
+                }
+                saw_buildkite = true;
+                if !candidate.is_empty() {
+                    buildkite = Some(SecretString::from(candidate));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(DotenvCredentials { github, buildkite })
+}
+
+#[cfg(not(debug_assertions))]
+fn resolve_credential(provider: ProviderCredential) -> Result<CredentialResolution, Error> {
+    if let Some(secret) = process_credential(provider) {
+        return Ok(CredentialResolution {
+            secret: Some(secret),
+            source: CredentialSource::Environment,
+        });
+    }
+    let source = match MacosCredentialStore
+        .presence(provider)
+        .map_err(credential_error)?
+    {
+        CredentialPresence::Present => CredentialSource::Keychain,
+        CredentialPresence::Missing => CredentialSource::Missing,
+    };
+    Ok(CredentialResolution {
+        secret: None,
+        source,
+    })
+}
+
+fn credential_environment_name(provider: ProviderCredential) -> &'static str {
+    match provider {
         ProviderCredential::GitHub => "AIRBORNE_GITHUB_TOKEN",
         ProviderCredential::Buildkite => "AIRBORNE_BUILDKITE_TOKEN",
-    };
-    if let Some(value) = env::var_os(name).filter(|x| !x.is_empty()) {
-        return Ok(SecretString::from(value.to_string_lossy().into_owned()));
     }
-    MacosCredentialStore.get(provider).map_err(credential_error)
 }
 fn credential_error(error: CredentialError) -> Error {
     Error {
@@ -694,40 +1373,35 @@ fn credential_error(error: CredentialError) -> Error {
         message: error.to_string(),
     }
 }
-fn source(provider: ProviderCredential) -> &'static str {
-    let env_name = match provider {
-        ProviderCredential::GitHub => "AIRBORNE_GITHUB_TOKEN",
-        ProviderCredential::Buildkite => "AIRBORNE_BUILDKITE_TOKEN",
-    };
-    if env::var_os(env_name).is_some_and(|value| !value.is_empty()) {
-        "environment"
-    } else if matches!(
-        MacosCredentialStore.presence(provider),
-        Ok(CredentialPresence::Present)
-    ) {
-        "keychain"
-    } else {
-        "missing"
-    }
+fn source(provider: ProviderCredential) -> Result<&'static str, Error> {
+    Ok(resolve_credential(provider)?.source.name())
 }
 
 async fn watch(cmd: WatchSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error> {
-    if let WatchSub::List { active: _, all } = &cmd {
-        let state = if *all { None } else { Some(WatchState::Active) };
-        let watches = store.list_watches(state).await.map_err(store_err)?;
+    if let WatchSub::List { active, all } = &cmd {
+        let mut watches = store
+            .list_watch_views(None)
+            .map_err(|e| Error::fail(e.to_string()))?;
+        if *active {
+            watches.retain(|watch| watch.watch.state == WatchState::Active);
+        } else if !*all {
+            watches.retain(|watch| watch.watch.state != WatchState::Archived);
+        }
         return out.emit("watch.list", json!({"watches": watches}));
     }
     if let WatchSub::Show { watch_id: id } = &cmd {
+        let id = resolve_watch_reference(store, id)?;
         let watch = store
-            .get_watch(&watch_id(id.clone())?)
+            .get_watch_view(&id)
             .map_err(|e| Error::fail(e.to_string()))?
             .ok_or_else(|| Error::fail("watch was not found"))?;
         return out.emit("watch.show", json!(watch));
     }
     if let WatchSub::Remove { watch_id: id, yes } = &cmd {
+        let id = resolve_watch_reference(store, id)?;
         confirm(*yes, "archive this watch")?;
         store
-            .archive_watch(&watch_id(id.clone())?, &now())
+            .archive_watch(&id, &now())
             .map_err(|e| Error::fail(e.to_string()))?;
         return out.emit("watch.remove", json!({"archived": true}));
     }
@@ -757,10 +1431,10 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
     {
         let watch = watch.clone().map(watch_id).transpose()?;
         let mut rules = store
-            .list_rules(watch.as_ref())
+            .list_rule_views(watch.as_ref())
             .map_err(|e| Error::fail(e.to_string()))?;
         if *enabled || !*all {
-            rules.retain(|rule| rule.enabled);
+            rules.retain(|rule| rule.rule.enabled);
         }
         return out.emit("rule.list", json!({"rules":rules}));
     }
@@ -828,7 +1502,7 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
         RuleSub::Show { rule_id: id } => out.emit(
             "rule.show",
             json!(store
-                .get_rule(&rule_id(id)?)
+                .get_rule_view(&rule_id(id)?)
                 .map_err(|e| Error::fail(e.to_string()))?
                 .ok_or_else(|| Error::fail("rule was not found"))?),
         ),
@@ -1126,21 +1800,12 @@ fn status(args: Status, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error
     let mut data = json!(status);
     for watch in data["watches"].as_array_mut().into_iter().flatten() {
         for rule in watch["rules"].as_array_mut().into_iter().flatten() {
-            let Some(id) = rule["rule"]["id"].as_str() else {
-                continue;
-            };
-            let definition = store
-                .get_rule_definition(&rule_id(id.to_owned())?)
-                .map_err(|e| Error::fail(e.to_string()))?;
-            if let Some(definition) = definition {
-                if let RuleConfig::GitHubCheckCompletes {
-                    alert_on_start,
-                    alert_if_missing_after_seconds,
-                    ..
-                } = definition.config
-                {
-                    rule["alert_policy"] = json!({"alert_on_start": alert_on_start, "alert_if_missing_after_seconds": alert_if_missing_after_seconds});
-                }
+            let config = &rule["definition"]["config"];
+            if text(config, "kind") == "git_hub_check_completes" {
+                rule["alert_policy"] = json!({
+                    "alert_on_start": config["alert_on_start"].as_bool().unwrap_or(false),
+                    "alert_if_missing_after_seconds": config["alert_if_missing_after_seconds"],
+                });
             }
         }
     }
@@ -1151,15 +1816,44 @@ async fn alerts(cmd: AlertsSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(
         let id = airborne_core::AlertId::new(alert_id.clone())
             .map_err(|e| Error::input(e.to_string()))?;
         let alert = store
-            .get_alert(&id)
+            .get_alert_view(&id)
             .map_err(|e| Error::fail(e.to_string()))?
             .ok_or_else(|| Error::fail("alert was not found"))?;
         return out.emit("alerts.show", json!(alert));
     }
-    match cmd{AlertsSub::List{all,watch,..}=>out.emit("alerts.list",json!({"alerts":store.list_alerts(!all,watch.map(watch_id).transpose()?).await.map_err(store_err)?})),AlertsSub::Acknowledge{alert_id,all,yes}=>{if all{confirm(yes,"acknowledge all alerts")?;let ids=store.list_alerts(true,None).await.map_err(store_err)?.into_iter().map(|a|a.id).collect::<Vec<_>>();let n=store.acknowledge(&ids,now()).await.map_err(store_err)?;return out.emit("alerts.acknowledge",json!({"acknowledged":n}));}let id=alert_id.ok_or_else(||Error::input("provide an alert ID or --all"))?;let n=store.acknowledge(&[airborne_core::AlertId::new(id).map_err(|e|Error::input(e.to_string()))?],now()).await.map_err(store_err)?;out.emit("alerts.acknowledge",json!({"acknowledged":n}))},AlertsSub::Show{..}=>Err(Error::fail("alerts show requires alert lookup"))}
+    match cmd {
+        AlertsSub::List { all, watch, .. } => {
+            let watch = watch.map(watch_id).transpose()?;
+            out.emit("alerts.list",json!({"alerts":store.list_alert_views(!all,watch.as_ref()).map_err(|e|Error::fail(e.to_string()))?,"mode":if all { "all" } else { "pending" }}))
+        }
+        AlertsSub::Acknowledge { alert_id, all, yes } => {
+            if all {
+                confirm(yes, "acknowledge all alerts")?;
+                let ids = store
+                    .list_alerts(true, None)
+                    .await
+                    .map_err(store_err)?
+                    .into_iter()
+                    .map(|a| a.id)
+                    .collect::<Vec<_>>();
+                let n = store.acknowledge(&ids, now()).await.map_err(store_err)?;
+                return out.emit("alerts.acknowledge", json!({"acknowledged":n}));
+            }
+            let id = alert_id.ok_or_else(|| Error::input("provide an alert ID or --all"))?;
+            let n = store
+                .acknowledge(
+                    &[airborne_core::AlertId::new(id).map_err(|e| Error::input(e.to_string()))?],
+                    now(),
+                )
+                .await
+                .map_err(store_err)?;
+            out.emit("alerts.acknowledge", json!({"acknowledged":n}))
+        }
+        AlertsSub::Show { .. } => Err(Error::fail("alerts show requires alert lookup")),
+    }
 }
 fn auth(cmd: AuthSub, out: &Out) -> Result<(), Error> {
-    match cmd{AuthSub::Status=>out.emit("auth.status",json!({"github":source(ProviderCredential::GitHub),"buildkite":source(ProviderCredential::Buildkite)})),AuthSub::Set{provider}=>{let p=provider_to(provider);let token=read_secret()?;MacosCredentialStore.set(p,token).map_err(credential_error)?;out.emit("auth.set",json!({"provider":p.account_name(),"source":"keychain"}))},AuthSub::Remove{provider,yes}=>{confirm(yes,"remove this credential")?;let p=provider_to(provider);MacosCredentialStore.remove(p).map_err(credential_error)?;out.emit("auth.remove",json!({"provider":p.account_name()}))}}
+    match cmd{AuthSub::Status=>out.emit("auth.status",json!({"github":source(ProviderCredential::GitHub)?,"buildkite":source(ProviderCredential::Buildkite)?})),AuthSub::Set{provider}=>{let p=provider_to(provider);let token=read_secret()?;MacosCredentialStore.set(p,token).map_err(credential_error)?;out.emit("auth.set",json!({"provider":p.account_name(),"source":"keychain"}))},AuthSub::Remove{provider,yes}=>{confirm(yes,"remove this credential")?;let p=provider_to(provider);MacosCredentialStore.remove(p).map_err(credential_error)?;out.emit("auth.remove",json!({"provider":p.account_name()}))}}
 }
 fn provider_to(value: ProviderArg) -> ProviderCredential {
     match value {
@@ -1286,7 +1980,7 @@ async fn doctor(
     } else {
         json!(null)
     };
-    out.emit("doctor",json!({"data_dir":dir,"schema_version":store.schema_version().map_err(|e|Error::fail(e.to_string()))?,"storage":"ok","github":source(ProviderCredential::GitHub),"buildkite":source(ProviderCredential::Buildkite),"leases":leases,"live":live}))
+    out.emit("doctor",json!({"data_dir":dir,"schema_version":store.schema_version().map_err(|e|Error::fail(e.to_string()))?,"storage":"ok","github":source(ProviderCredential::GitHub)?,"buildkite":source(ProviderCredential::Buildkite)?,"leases":leases,"live":live}))
 }
 fn migrate(cmd: MigrateSub, dir: &Path, out: &Out) -> Result<(), Error> {
     match cmd {
@@ -1425,5 +2119,44 @@ mod tests {
             serde_json::from_str::<Value>(&output).unwrap()["outcome"],
             "partial"
         );
+    }
+
+    #[test]
+    fn status_renders_watch_issues_and_one_poll_summary() {
+        let data = json!({"watches":[{
+            "watch":{"id":"watch-1","state":"active"},
+            "subject":{"key":"github.com/owner/repo/pull/7","display_title":"A title","canonical_url":"https://github.com/owner/repo/pull/7","current_revision":"abc"},
+            "pending_alert_count":0,
+            "latest_issue":{"safe_message":"GitHub is unavailable"},
+            "latest_poll_outcome":"partial",
+            "latest_poll_finished_at":"2026-09-10T18:41:00Z",
+            "rules":[{"rule":{"enabled":true,"archived_at":null,"kind":"git_hub_check_completes"},"definition":{"config":{"kind":"git_hub_check_completes","check_name":"Cursor Bugbot"}},"latest_observation":{"state":"in_progress","observed_at":"2026-09-10T18:40:00Z"}}]
+        }]});
+        let output = render_status(&data, false);
+        assert!(output.contains("Issue: GitHub is unavailable"));
+        assert!(output.contains("Checked Sep 10, 2026 at"));
+        assert!(output.contains("last poll partial"));
+        assert!(output.contains("observed Sep 10, 2026 at"));
+        assert_eq!(output.matches("Checked ").count(), 1);
+    }
+
+    #[test]
+    fn archived_rule_never_inherits_missing_duration() {
+        let rule = json!({
+            "rule":{"archived_at":"2026-09-10T00:00:00Z","enabled":false},
+            "latest_observation":{"state":"not_detected","first_observed_at":"2020-01-01T00:00:00Z"}
+        });
+        assert_eq!(rule_display_state(&rule), "archived");
+    }
+
+    #[test]
+    fn buildkite_rule_show_includes_organization() {
+        let rule = json!({
+            "id":"rule-1", "enabled":true, "archived_at":null, "current_version":1,
+            "subject":{"key":"github.com/owner/repo/pull/7","display_title":"A title"},
+            "definition":{"config":{"kind":"buildkite_job_completes","job_name":"test","github_status_context":"buildkite/test","expected_organization":"acme","expected_pipeline":"main"}},
+            "latest_observation":null
+        });
+        assert!(render_rule_show(&rule, false).contains("Organization     acme"));
     }
 }

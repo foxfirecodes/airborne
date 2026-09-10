@@ -107,13 +107,16 @@ errors must not call it `PR Watcher`.
 ```text
 airborne watch add <GITHUB_PR_URL> [--paused]
 airborne watch list [--active|--all]
-airborne watch show <WATCH_ID>
+airborne watch show <WATCH_ID_OR_GITHUB_PR_URL>
 airborne watch pause <WATCH_ID>
 airborne watch resume <WATCH_ID>
-airborne watch remove <WATCH_ID> [--yes]
+airborne watch remove <WATCH_ID_OR_GITHUB_PR_URL> [--yes]
 ```
 
 - `watch add` must accept only a canonical HTTPS GitHub pull request URL.
+- `watch list` must show each canonical pull request URL. `watch show` and
+  `watch remove` must accept that URL as the natural watch identifier while
+  retaining watch ID support for compatibility.
 - It must fetch and store the PR title and current head revision before it
   commits the watch.
 - Adding the same active or archived subject must fail with a useful message.
@@ -248,10 +251,28 @@ airborne migrate prototype [--from <DATABASE>] [--credentials] [--dry-run]
 - The Keychain service name is `airborne`. Account names are `github_token` and
   `buildkite_token`.
 - It must refuse token text passed as a command argument.
-- `AIRBORNE_GITHUB_TOKEN` and `AIRBORNE_BUILDKITE_TOKEN` must override Keychain
-  for the current process and must never be persisted.
+- Release builds must use a nonempty `AIRBORNE_GITHUB_TOKEN` or
+  `AIRBORNE_BUILDKITE_TOKEN` from the current process before Keychain. They
+  must never persist either value or load `.env`.
+- A release Keychain read failure must propagate as a safe credential error,
+  not be treated as a missing credential.
+- Debug builds must use a nonempty process `AIRBORNE_GITHUB_TOKEN` or
+  `AIRBORNE_BUILDKITE_TOKEN` first, then a nonempty value from `./.env` in the
+  process working directory. They must never read Keychain for credential reads
+  or `auth status` or `doctor`. An empty process value may be filled by a
+  nonempty `.env` value; otherwise it is missing and must never fall back to
+  Keychain. A nonempty process token for a provider must skip `.env` lookup for
+  that provider. A missing `.env` is valid. Duplicate `AIRBORNE_GITHUB_TOKEN`
+  or `AIRBORNE_BUILDKITE_TOKEN` entries, or an existing malformed or unreadable
+  `.env`, must fail safely without credential fallback only when Airborne must
+  resolve a credential from that file.
 - `auth status` may report the active source as `environment`, `keychain`, or
-  `missing`; it must not reveal any part of the token.
+  `missing` for release builds. Debug builds report `environment`, `.env`, or
+  `missing`; `doctor` must use the same distinction. Neither command may reveal
+  any part of a token.
+- `auth set`, `auth remove`, and `migrate prototype --credentials` must always
+  explicitly access Keychain as their operation requires, including when a
+  debug build never reads Keychain for normal credential resolution.
 - `doctor` must check data paths, migrations, locks, and credential presence
   without making network requests.
 - `doctor --live` must also make the least costly authenticated request to each
@@ -260,7 +281,8 @@ airborne migrate prototype [--from <DATABASE>] [--credentials] [--dry-run]
   `--from` is absent, print a plan with `--dry-run`, and require confirmation
   before the first real import.
 - `--credentials` must separately confirm before copying prototype Keychain
-  items. A database import must not imply credential access.
+  items. A database import must not imply credential access; this explicit
+  credential import remains available in debug builds.
 
 ## 4. Output and exit status
 

@@ -128,7 +128,9 @@ fn interactive(args: &[String], input: &[u8]) -> Output {
     // `script` gives the child a controlling terminal while retaining a
     // process-level test. macOS ships it as part of the base system.
     let binary = assert_cmd::cargo::cargo_bin("airborne");
-    let mut child = ProcessCommand::new("/usr/bin/script")
+    let mut command = ProcessCommand::new("/usr/bin/script");
+    command.env_remove("NO_COLOR");
+    let mut child = command
         .args(["-q", "/dev/null"])
         .arg(binary)
         .args(args)
@@ -150,6 +152,19 @@ fn interactive(args: &[String], input: &[u8]) -> Output {
     let output = child.wait_with_output().expect("wait for pseudo-terminal");
     writer.join().expect("prompt writer");
     output
+}
+
+fn interactive_with_no_color(args: &[String]) -> Output {
+    let _guard = process_test_guard();
+    let binary = assert_cmd::cargo::cargo_bin("airborne");
+    let mut command = ProcessCommand::new("/usr/bin/script");
+    command.env_remove("NO_COLOR");
+    command
+        .args(["-q", "/dev/null", "/usr/bin/env", "NO_COLOR=1"])
+        .arg(binary)
+        .args(args)
+        .output()
+        .expect("start NO_COLOR pseudo-terminal")
 }
 
 fn wait_for_exit(child: &mut std::process::Child, within: Duration) -> std::process::ExitStatus {
@@ -200,6 +215,17 @@ fn offline_json(data: &TempDir, args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     json(&output.stdout)
+}
+
+fn offline_human(data: &TempDir, args: &[&str]) -> String {
+    let output = airborne()
+        .arg("--data-dir")
+        .arg(data.path())
+        .args(args)
+        .output()
+        .expect("run offline human CLI command");
+    assert!(output.status.success(), "human command failed: {args:?}");
+    String::from_utf8(output.stdout).expect("UTF-8 output")
 }
 
 #[test]
@@ -440,6 +466,148 @@ fn imported_data_supports_offline_watch_rule_alert_and_status_crud() {
             .assert()
             .success();
     }
+}
+
+#[test]
+fn human_views_prioritize_pull_requests_names_and_states() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let pull_request_url = "https://github.com/owner/repo/pull/7";
+    let rule_id = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"][0]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_owned();
+    let alert_id = offline_json(&data, &["alerts", "list", "--all"])["data"]["alerts"][0]["id"]
+        .as_str()
+        .expect("alert id")
+        .to_owned();
+    for (args, expected) in [
+        (
+            vec!["status"],
+            vec![
+                "Airborne status",
+                "owner/repo #7 — A title",
+                "Cursor Bugbot",
+            ],
+        ),
+        (
+            vec!["watch", "list"],
+            vec!["Watches", "owner/repo #7 — A title", pull_request_url],
+        ),
+        (
+            vec!["watch", "show", pull_request_url],
+            vec!["Pull request", "Rules", "Alerts"],
+        ),
+        (
+            vec!["rule", "list"],
+            vec!["Rules", "Cursor Bugbot", "owner/repo #7 — A title"],
+        ),
+        (
+            vec!["rule", "show", &rule_id],
+            vec!["Check name", "Alerts", "When completed"],
+        ),
+        (
+            vec!["alerts", "list", "--all"],
+            vec!["Alerts", "owner/repo #7 — A title"],
+        ),
+        (
+            vec!["alerts", "show", &alert_id],
+            vec!["Pull request", "Rule", "Event"],
+        ),
+    ] {
+        let output = offline_human(&data, &args);
+        assert!(
+            !output.contains("\x1b["),
+            "piped output has no ANSI: {output:?}"
+        );
+        for expected in expected {
+            assert!(
+                output.contains(expected),
+                "{args:?} missing {expected:?}: {output}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_pull_request_url_addresses_watch_show_and_remove() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let pull_request_url = "https://github.com/owner/repo/pull/7";
+
+    let shown = offline_json(&data, &["watch", "show", pull_request_url]);
+    assert_eq!(shown["data"]["subject"]["canonical_url"], pull_request_url);
+
+    let removed = offline_json(&data, &["watch", "remove", pull_request_url, "--yes"]);
+    assert_eq!(removed["data"]["archived"], true);
+    assert!(offline_json(&data, &["watch", "list"])["data"]["watches"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+}
+
+#[test]
+fn human_alert_modes_lifecycle_precedence_and_missing_time_are_clear() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let database = data.path().join("airborne.sqlite3");
+    let alert_id = offline_json(&data, &["alerts", "list", "--all"])["data"]["alerts"][0]["id"]
+        .as_str()
+        .expect("alert id")
+        .to_owned();
+    offline_json(&data, &["alerts", "acknowledge", &alert_id]);
+    let all = offline_human(&data, &["alerts", "list", "--all"]);
+    assert!(all.starts_with("Alerts\n"));
+    assert!(all.contains("acknowledged"));
+    assert_eq!(
+        offline_human(&data, &["alerts", "list"]),
+        "Pending alerts\nNo pending alerts.\n"
+    );
+
+    sqlite_execute(&database, "UPDATE observation SET state='not_detected',first_observed_at='2020-01-01T00:00:00Z'; UPDATE alert SET acknowledged_at=NULL,status='pending',event_kind='missing';");
+    assert!(offline_human(&data, &["alerts", "list"]).contains("missing for"));
+
+    sqlite_execute(
+        &database,
+        "UPDATE rule SET state='archived',archived_at='2026-09-08T00:03:00Z';",
+    );
+    let rules = offline_human(&data, &["rule", "list", "--all"]);
+    assert!(rules.contains("archived"));
+    assert!(
+        !rules.contains("completed  ·"),
+        "archived must win over stale observation: {rules}"
+    );
+}
+
+#[test]
+fn pseudo_terminal_color_respects_no_color_and_json() {
+    let data = data_dir();
+    let args = vec![
+        "--data-dir".into(),
+        data.path().display().to_string(),
+        "status".into(),
+    ];
+    let colored = interactive(&args, b"");
+    assert!(colored.status.success());
+    assert!(
+        String::from_utf8_lossy(&colored.stdout).contains("\x1b[1m"),
+        "{:?}",
+        String::from_utf8_lossy(&colored.stdout)
+    );
+
+    let mut no_color = args.clone();
+    no_color.insert(0, "--no-color".into());
+    assert!(!String::from_utf8_lossy(&interactive(&no_color, b"").stdout).contains("\x1b["));
+    assert!(!String::from_utf8_lossy(&interactive_with_no_color(&args).stdout).contains("\x1b["));
+
+    let json = vec![
+        "--data-dir".into(),
+        data.path().display().to_string(),
+        "status".into(),
+        "--json".into(),
+    ];
+    let output = interactive(&json, b"");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\x1b["));
+    assert_envelope(&interactive_json(&output.stdout), "status");
 }
 
 #[test]
@@ -799,7 +967,9 @@ fn human_status_uses_readable_lifecycle_labels() {
             ),
         );
         let output = human_status(&data, &watch_id);
-        assert!(output.contains(&format!("\t{human}\tlast observed")));
+        assert!(output.contains(human));
+        assert!(output.contains("owner/repo #7 — A title"));
+        assert!(output.contains("Cursor Bugbot"), "{output}");
         if stored != human {
             assert!(!output.contains(stored));
         }

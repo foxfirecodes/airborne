@@ -50,6 +50,26 @@ Use `airborne run` to poll in the foreground. Press Ctrl-C to stop it safely. Us
 
 `airborne auth status` reports only whether each credential comes from the environment, Keychain, or is missing. `airborne doctor` checks local state without a network call; add `--live` for read-only provider checks.
 
+### Local debug credentials
+
+Debug builds use a nonempty process token first, then a nonempty `./.env` value
+in the process working directory. Copy [`.env.example`](.env.example) to
+`.env`, then add the tokens you need. They never read Keychain for credentials
+or `auth status` or `doctor`; those commands report whether a value came from
+the environment, `.env`, or neither. An empty process value may be filled by a
+nonempty `.env` value; otherwise it is missing and does not fall back to
+Keychain. A nonempty process token for one provider skips `.env` lookup for that
+provider. A missing `.env` is fine. Duplicate `AIRBORNE_GITHUB_TOKEN` or
+`AIRBORNE_BUILDKITE_TOKEN` keys, or an existing malformed or unreadable `.env`,
+are errors only when Airborne must resolve a credential from that file.
+
+Release builds do not load `.env`: nonempty process environment values take
+precedence over Keychain. `airborne auth set` and `airborne auth remove` always
+write to or remove from Keychain, even when a debug build ignores it for reads.
+`airborne migrate prototype --credentials` is likewise an explicit Keychain
+operation. If a release Keychain read fails, Airborne reports a safe credential
+error; it does not report the credential as missing.
+
 ## Troubleshooting
 
 - Run `airborne doctor` first. It checks the data directory, migrations, locks, and credential presence without contacting providers.

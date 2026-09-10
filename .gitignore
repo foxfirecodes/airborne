@@ -1,6 +1,9 @@
 node_modules/
 dist/
 *.tsbuildinfo
+.env
+.env.*
+!.env.example
 
 src-tauri/target/
 src-tauri/gen/

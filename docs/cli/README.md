@@ -30,6 +30,8 @@ the shared crates or weaken the CLI contract.
   records, state changes, and alert rules.
 - [`architecture.md`](architecture.md) defines components, dependency rules,
   and contracts.
+- [`output-contract.md`](output-contract.md) defines the human output for
+  status, watches, rules, and alerts.
 
 ## How to use these documents
 
@@ -43,3 +45,5 @@ Code, tests, command help, and storage migrations must use the names in the
 domain model. A change to product behavior must update these documents in the
 same change as the code. This specification deliberately leaves a broader CLI
 UX redesign for later work.
+
+For local debug credentials, see [the repository README](../../README.md#local-debug-credentials).

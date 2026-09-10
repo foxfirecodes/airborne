@@ -12,7 +12,7 @@ Use this record for a user-approved, read-only validation against a known pull r
 | Data directory | Redacted local path if needed |
 | Pull request | Redacted or approved canonical URL |
 | Rules | Exact check, status context, organization, pipeline, job, and notify policy |
-| Credential source | Environment, Keychain, or missing; never token text |
+| Credential source | Debug: environment, `.env`, or missing. Release: environment, Keychain, or missing. Never token text. |
 
 ## Evidence
 
