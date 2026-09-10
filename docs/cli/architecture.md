@@ -217,6 +217,7 @@ Own:
 - selecting active watches for a refresh;
 - grouping rules and invoking the right subject monitor;
 - lifecycle reconciliation;
+- durable per-revision missing-threshold and source-seen lifecycle state;
 - atomic application through storage ports;
 - refresh and poll reports;
 - bounded concurrency and cancellation;
@@ -298,15 +299,17 @@ Required logical records:
 subject
 watch
 rule
-rule_definition
-observation
-alert
-poll_attempt
-source_issue
-setting
-lease
-schema_migration
-import_record
+  rule_definition
+  observation
+  revision_lifecycle
+  alert
+  poll_attempt
+  source_issue
+  setting
+  lease
+  schema_migration
+  migration_repair
+  import_record
 ```
 
 Physical table names may differ, but migrations and store tests must show a
@@ -317,7 +320,10 @@ Required database constraints include:
 - one non-archived watch per subject;
 - unique `(rule_id, version)` definition;
 - unique `(rule_id, rule_version, revision)` observation;
-- unique `(rule_id, rule_version, revision, source_identity)` alert;
+- unique `(rule_id, rule_version, revision, event_kind, source_identity)`
+  alert, with a normalized sentinel for a missing source identity;
+- one non-archived rule kind per watch, enforced by a partial unique index or
+  an equivalent transactional constraint;
 - no cascading delete from watch or rule into alerts;
 - monotonic schema migration versions.
 
@@ -325,6 +331,12 @@ Lease rows must include owner identity and expiry so a crashed process cannot
 block Airborne forever. An active runner lease must use renewal. Refresh leases
 must cover only a refresh, not runner sleep, and must renew during long network
 requests. Loss of lease renewal must cancel new work before another commit.
+
+The migration that introduces the rule-kind constraint must retain every legacy
+rule, version, observation, and alert. It must keep the earliest active row in
+each duplicate `(watch_id, kind)` group (creation time, then ID) and archive
+the other rows. A durable repair record must name the surviving and archived
+rule IDs and the deterministic reason. It must be idempotent.
 
 ### 4.7 `airborne-credentials-macos`
 
@@ -419,6 +431,12 @@ pub trait StatusRepository {
 `watch add` also needs current GitHub metadata. Put that workflow in a small
 application service owned by runtime or CLI composition; do not let the SQLite
 repository call GitHub.
+
+`add_rule` must return a typed conflict when a non-archived rule of that kind
+already exists for the watch, including when that existing rule is disabled.
+Rule updates must distinguish policy set, policy clear, and policy unchanged so
+the CLI can implement explicit start enable/disable and missing-threshold
+set/clear flags without ambiguous optional values.
 
 ## 6. Error contracts
 

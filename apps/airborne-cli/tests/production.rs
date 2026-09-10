@@ -482,6 +482,10 @@ fn offline_command_result_envelopes_have_stable_command_specific_shapes() {
     ] {
         assert_envelope(&offline_json(&data, &args), command);
     }
+    assert_envelope(
+        &offline_json(&data, &["rule", "remove", &rule_id, "--yes"]),
+        "rule.remove",
+    );
     let added = offline_json(&data, &["rule", "add", "bugbot", &watch_id]);
     assert_envelope(&added, "rule.add");
     let added_id = added["data"]["id"]
@@ -746,4 +750,196 @@ fn run_emits_ndjson_and_signal_shutdown_releases_the_runner_lease() {
         .status()
         .expect("send SIGINT");
     assert!(wait_for_exit(&mut restarted, Duration::from_secs(10)).success());
+}
+
+fn imported_watch_rule(data: &TempDir) -> (String, String) {
+    let (_source, _) = imported_fixture(data);
+    let watch_id = offline_json(data, &["watch", "list", "--all"])["data"]["watches"][0]["id"]
+        .as_str()
+        .expect("watch id")
+        .to_owned();
+    let rule_id = offline_json(data, &["rule", "list", "--all"])["data"]["rules"][0]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_owned();
+    (watch_id, rule_id)
+}
+
+fn human_status(data: &TempDir, watch_id: &str) -> String {
+    let status = airborne()
+        .arg("--data-dir")
+        .arg(data.path())
+        .args(["status", "--watch", watch_id])
+        .output()
+        .expect("human status");
+    assert!(status.status.success());
+    String::from_utf8(status.stdout).expect("UTF-8 status")
+}
+
+#[test]
+fn human_status_uses_readable_lifecycle_labels() {
+    let data = data_dir();
+    let (watch_id, rule_id) = imported_watch_rule(&data);
+
+    sqlite_execute(
+        &data.path().join("airborne.sqlite3"),
+        "DELETE FROM observation;",
+    );
+    assert!(human_status(&data, &watch_id).contains("no observation"));
+
+    for (stored, human) in [
+        ("not_detected", "not detected"),
+        ("waiting", "waiting"),
+        ("in_progress", "in progress"),
+    ] {
+        sqlite_execute(
+            &data.path().join("airborne.sqlite3"),
+            &format!(
+                "INSERT INTO observation(rule_id,rule_version,revision,state,observed_at,first_observed_at) VALUES ('{rule_id}',1,'abc','{stored}','2026-09-10T00:00:00Z','2026-09-10T00:00:00Z');"
+            ),
+        );
+        let output = human_status(&data, &watch_id);
+        assert!(output.contains(&format!("\t{human}\tlast observed")));
+        if stored != human {
+            assert!(!output.contains(stored));
+        }
+        let json_status = offline_json(&data, &["status", "--watch", &watch_id]);
+        assert_eq!(
+            json_status["data"]["watches"][0]["rules"][0]["latest_observation"]["state"],
+            stored,
+        );
+        sqlite_execute(
+            &data.path().join("airborne.sqlite3"),
+            "DELETE FROM observation;",
+        );
+    }
+}
+
+#[test]
+fn bugbot_alert_options_update_and_clear() {
+    let data = data_dir();
+    let (watch_id, rule_id) = imported_watch_rule(&data);
+    let help = airborne()
+        .args(["rule", "add", "bugbot", "--help"])
+        .output()
+        .expect("Bugbot help");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--alert-on-start"));
+    assert!(help.contains("--alert-if-missing-after"));
+
+    airborne()
+        .args(["--json", "--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule",
+            "update",
+            &rule_id,
+            "--alert-on-start",
+            "--alert-if-missing-after",
+            "5m",
+        ])
+        .assert()
+        .success();
+    let status = offline_json(&data, &["status", "--watch", &watch_id]);
+    let policy = &status["data"]["watches"][0]["rules"][0]["alert_policy"];
+    assert_eq!(policy["alert_on_start"], true);
+    assert_eq!(policy["alert_if_missing_after_seconds"], 300);
+
+    airborne()
+        .args(["--json", "--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule",
+            "update",
+            &rule_id,
+            "--no-alert-on-start",
+            "--no-alert-if-missing-after",
+        ])
+        .assert()
+        .success();
+    let status = offline_json(&data, &["status", "--watch", &watch_id]);
+    let policy = &status["data"]["watches"][0]["rules"][0]["alert_policy"];
+    assert_eq!(policy["alert_on_start"], false);
+    assert!(policy["alert_if_missing_after_seconds"].is_null());
+
+    airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args(["rule", "update", &rule_id, "--alert-if-missing-after", "0s"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("greater than zero"));
+}
+
+#[test]
+fn duplicate_bugbot_rules_require_archiving_before_replacement() {
+    let data = data_dir();
+    let (watch_id, rule_id) = imported_watch_rule(&data);
+    let duplicate = airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args(["rule", "add", "bugbot", &watch_id])
+        .output()
+        .expect("reject duplicate rule");
+    assert_eq!(duplicate.status.code(), Some(2));
+    let duplicate = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(duplicate.contains(&rule_id));
+    assert!(duplicate.contains("archive"));
+
+    airborne()
+        .args(["--json", "--data-dir"])
+        .arg(data.path())
+        .args(["rule", "disable", &rule_id])
+        .assert()
+        .success();
+    let disabled_duplicate = airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args(["rule", "add", "bugbot", &watch_id])
+        .output()
+        .expect("reject disabled duplicate rule");
+    assert_eq!(disabled_duplicate.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&disabled_duplicate.stderr).contains("currently disabled"));
+
+    airborne()
+        .args(["--json", "--data-dir"])
+        .arg(data.path())
+        .args(["rule", "remove", &rule_id, "--yes"])
+        .assert()
+        .success();
+    let added = offline_json(&data, &["rule", "add", "bugbot", &watch_id]);
+    let added_id = added["data"]["id"]
+        .as_str()
+        .expect("added rule id")
+        .to_owned();
+    let status = offline_json(&data, &["status", "--watch", &watch_id]);
+    let policy = &status["data"]["watches"][0]["rules"][0]["alert_policy"];
+    assert_eq!(policy["alert_on_start"], false);
+    assert!(policy["alert_if_missing_after_seconds"].is_null());
+    assert_envelope(
+        &offline_json(&data, &["rule", "remove", &added_id, "--yes"]),
+        "rule.remove",
+    );
+    let added = offline_json(
+        &data,
+        &[
+            "rule",
+            "add",
+            "bugbot",
+            &watch_id,
+            "--alert-on-start",
+            "--alert-if-missing-after",
+            "1h",
+        ],
+    );
+    let added_id = added["data"]["id"].as_str().expect("added rule id");
+    let status = offline_json(&data, &["status", "--watch", &watch_id]);
+    let policy = &status["data"]["watches"][0]["rules"][0]["alert_policy"];
+    assert_eq!(policy["alert_on_start"], true);
+    assert_eq!(policy["alert_if_missing_after_seconds"], 3600);
+    assert_eq!(
+        status["data"]["watches"][0]["rules"][0]["rule"]["id"],
+        added_id
+    );
 }

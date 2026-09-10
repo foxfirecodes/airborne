@@ -20,8 +20,10 @@ payload names stay inside provider components unless this document adopts them.
 | **Candidate** | One successful rule evaluation for one rule version and revision, before lifecycle policy. |
 | **Source identity** | The stable provider identity of the item that produced a candidate, such as a check-run ID or stable set of job IDs. |
 | **Observation** | The durable latest candidate for one rule version and revision. |
+| **Revision lifecycle** | Durable state for an armed revision: its first undetected time and whether any matching source has appeared. |
 | **Source issue** | A provider, decoding, or resolution failure. It is not a rule result and cannot cause an alert. |
 | **Reconciliation** | The pure decision that turns a candidate and prior history into a new observation and optional alert draft. |
+| **Alert event** | `missing`, `started`, or `terminal`: the event represented by an alert. |
 | **Alert** | An immutable durable event produced by reconciliation. |
 | **Acknowledgement** | The user's explicit statement that an alert no longer needs attention. |
 | **Poll attempt** | One attempt to inspect one watched subject during a refresh. |
@@ -129,6 +131,10 @@ RuleDefinition
   created_at
 ```
 
+There may be at most one non-archived rule of a given kind for a watch.
+Disabled rules count as non-archived and occupy the kind slot. Archiving a rule
+frees it. The store must enforce this invariant, not merely the CLI.
+
 Rule definitions are append-only. Updating a match field or alert policy adds
 a definition and increments `current_version` in one transaction. Enabling a
 disabled rule also copies its current definition into a new version. Resuming
@@ -140,6 +146,8 @@ Version 1 has two rule kinds:
 ```text
 GitHubCheckCompletes
   check_name
+  alert_on_start: bool = false
+  alert_if_missing_after?: Duration
 
 BuildkiteJobCompletes
   github_status_context
@@ -158,7 +166,7 @@ Candidate
   rule_key: (rule_id, rule_version)
   subject_key
   revision
-  state: waiting | in_progress | completed | failed | unavailable
+  state: not_detected | waiting | in_progress | completed | failed | unavailable
   source_identity?
   source_url?
   detail?
@@ -174,7 +182,8 @@ State meanings:
 
 | State | Meaning |
 | --- | --- |
-| `waiting` | The expected provider item does not exist yet, but it may appear. |
+| `not_detected` | The exact expected GitHub check does not exist yet. |
+| `waiting` | The provider item exists but is queued and has not begun running. |
 | `in_progress` | The provider item exists and has not reached the rule's terminal condition. |
 | `completed` | The item reached an accepted successful or neutral completion. |
 | `failed` | The item reached a known non-success terminal result. |
@@ -184,9 +193,24 @@ State meanings:
 provider response, rate limit, or network error is a source issue, not an
 unavailable candidate.
 
-An alert intent contains the source identity, title, body, and whether the
-candidate satisfies the rule's chosen alert policy. A candidate may be failed
-and still carry an alert intent when `notify_on` is `terminal`.
+An alert intent is a typed provider result:
+
+```text
+AlertIntent
+  event_kind: missing | started | terminal
+  source_identity?
+  title
+  body
+```
+
+The subject monitor constructs it from the matched provider result and the
+rule's alert policy. A Bugbot `not_detected` result with a configured missing
+threshold carries `missing`. A Bugbot `waiting` or `in_progress` result carries
+`started` when `alert_on_start` is enabled. A terminal candidate carries
+`terminal` when it satisfies its completion policy; a failed Buildkite result
+may therefore carry `terminal` when `notify_on` is `terminal`. A source first
+seen terminal carries only `terminal`, never `started`. Reconciliation gates
+the intent against durable lifecycle history and alert-key deduplication.
 
 ### 4.5 Observation
 
@@ -213,7 +237,8 @@ Source issues never overwrite an observation.
 ```text
 Alert
   id
-  key: (rule_id, rule_version, revision, source_identity)
+  key: (rule_id, rule_version, revision, event_kind, source_identity?)
+  event_kind: missing | started | terminal
   watch_id
   subject_key
   rule_kind
@@ -224,14 +249,33 @@ Alert
   acknowledged_at?
 ```
 
-The key is unique. The alert copies the subject and rule details needed to show
+The key is unique. `event_kind` lets one source produce a start alert and a
+later terminal alert without either suppressing the other. A missing alert has
+no source identity. The alert copies the subject and rule details needed to show
 useful history after a watch or rule is archived. The event fields are
 immutable. Only `acknowledged_at` may change.
 
 An alert with no acknowledgement is pending. Acknowledgement does not alter an
 observation or prevent a later alert with a different key.
 
-### 4.7 Poll attempt and source issue
+### 4.7 Revision lifecycle
+
+```text
+RevisionLifecycle
+  rule_id
+  rule_version
+  revision
+  first_not_detected_at?
+  source_seen: bool
+```
+
+There is one record for each armed revision after a rule-version baseline. The
+first `not_detected` result sets `first_not_detected_at`; later undetected
+results must not reset it. Any candidate with a source identity sets
+`source_seen` permanently. Reconciliation reads and updates this record in the
+same transaction as its observation and alerts.
+
+### 4.8 Poll attempt and source issue
 
 ```text
 PollAttempt
@@ -269,10 +313,11 @@ For the current pull request revision:
 
 1. Fetch check runs only if an enabled check rule needs them.
 2. Match the configured check name exactly.
-3. No match yields `waiting` with no source identity.
-4. Any matched non-completed check yields `in_progress`.
-5. A matched check with `status == "completed"` yields `completed` and an alert
-   intent regardless of conclusion.
+3. No exact-name match yields `not_detected` with no source identity.
+4. A matched check with queued status yields `waiting`. A matched check that is
+   neither queued nor completed yields `in_progress`.
+5. A matched check with `status == "completed"` yields `completed` and a
+   `terminal` alert intent regardless of conclusion.
 6. Include the conclusion in detail and alert text when present. `neutral` is a
    completion, not a failure.
 7. Use the GitHub check-run ID as source identity.
@@ -297,7 +342,7 @@ For the current pull request revision:
 7. Any matched nonterminal job yields `in_progress`.
 8. All matched jobs terminal yields `completed` if all passed and `failed` if
    any did not pass.
-9. `notify_on: terminal` creates alert intent for completed or failed results.
+9. `notify_on: terminal` creates a `terminal` alert intent for completed or failed results.
    `notify_on: passed` creates it only when all jobs passed.
 
 Terminal job states are `passed`, `failed`, `timed_out`, `canceled`, `skipped`,
@@ -328,31 +373,45 @@ pub struct Reconciliation {
 ```
 
 `RuleHistory` supplies the latest successful observation across revisions for
-the same rule version and whether the candidate's alert key already exists.
+the same rule version; per-revision first-observed and source-seen history; and
+whether each event's alert key already exists. It persists the time when a
+revision first becomes `not_detected` so a missing threshold survives a restart.
 
 Apply these rules in order:
 
 1. A source issue never calls `reconcile`.
 2. The first candidate for a rule version is its baseline. Save the observation
-   and suppress its alert intent, even if the candidate is terminal.
-3. After a baseline, a candidate for a new revision is armed. If it carries an
-   alert intent, create an alert even when the first candidate seen for that
-   revision is already terminal.
-4. On the same revision, create an alert when an eligible source identity has
-   not appeared in the alert key before. Waiting and in-progress observations
-   followed by a terminal intent therefore alert.
-5. Never create an alert when the candidate has no alert intent.
-6. Never create an alert when its full key already exists.
-7. Always return the new observation, including when the alert is suppressed.
+   and do not emit an event from that candidate, even if it is terminal. A
+   baseline `not_detected` candidate starts its durable missing timer.
+3. After a baseline, the first candidate for a new revision arms that revision.
+   Reconciliation may create its `terminal` alert but must never add a
+   retroactive `started` alert.
+4. A `missing` intent starts the missing threshold when an armed revision first
+   becomes `not_detected`. Once it elapses, reconciliation creates one
+   `missing` alert if no matching source has been seen. The elapsed state is
+   durable across restarts.
+5. Once a source has been seen on a revision, suppress missing alerts for that
+   revision forever, including if a later poll is `not_detected` again.
+6. A `started` intent may create one `started` alert on the source's first
+   `waiting` or `in_progress` observation for an armed revision. A source first
+   observed terminal cannot create a `started` alert.
+7. A candidate with a `terminal` alert intent may create one `terminal` alert.
+   `started` and `terminal` events for the same source do not collide.
+8. Never create an alert when its full event key already exists.
+9. Always return the new observation, including when every alert is suppressed.
 
 This gives these required cases:
 
 | Prior history | Candidate | Result |
 | --- | --- | --- |
 | No candidate for rule version | completed | Baseline, no alert |
-| Baseline waiting, same revision | completed, new identity | Alert |
-| Baseline completed, same revision | same identity | No alert |
-| Any baseline, new revision | completed | Alert |
+| Baseline `not_detected`, same revision, threshold elapses | no source | One missing alert |
+| Any source seen, later `not_detected` | no source | No missing alert |
+| Baseline waiting, same revision | in progress, new identity | Started alert if enabled |
+| First observed source is completed | terminal | Terminal alert, no started alert |
+| Started source, same revision | terminal, same identity | Terminal alert; started remains distinct |
+| Baseline completed, same revision | same event and identity | No alert |
+| Any baseline, new revision | completed | Terminal alert |
 | Any history | source issue | No observation, no alert |
 | Rule updated or re-enabled | completed | New-version baseline, no alert |
 

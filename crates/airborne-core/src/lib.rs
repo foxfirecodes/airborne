@@ -34,10 +34,14 @@ pub enum DomainError {
     AlertSourceMismatch,
     #[error("an alert intent requires a source identity")]
     MissingAlertSource,
+    #[error("a missing-check alert intent cannot have a source identity")]
+    MissingAlertHasSource,
     #[error("a multi-job source needs at least one job ID")]
     EmptyJobSet,
     #[error("a multi-job source cannot contain duplicate job IDs")]
     DuplicateJobId,
+    #[error("missing-check alert delay must be greater than zero seconds")]
+    InvalidMissingAlertDelay,
 }
 
 macro_rules! string_value {
@@ -314,6 +318,10 @@ pub enum BuildkiteNotifyOn {
 pub enum RuleConfig {
     GitHubCheckCompletes {
         check_name: String,
+        #[serde(default)]
+        alert_on_start: bool,
+        #[serde(default)]
+        alert_if_missing_after_seconds: Option<u64>,
     },
     BuildkiteJobCompletes {
         github_status_context: GitHubStatusContext,
@@ -329,6 +337,18 @@ impl RuleConfig {
             Self::GitHubCheckCompletes { .. } => RuleKind::GitHubCheckCompletes,
             Self::BuildkiteJobCompletes { .. } => RuleKind::BuildkiteJobCompletes,
         }
+    }
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if matches!(
+            self,
+            Self::GitHubCheckCompletes {
+                alert_if_missing_after_seconds: Some(0),
+                ..
+            }
+        ) {
+            return Err(DomainError::InvalidMissingAlertDelay);
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,24 +382,79 @@ impl VersionedRule {
         {
             return Err(DomainError::InvalidRuleDefinition);
         }
-        Ok(())
+        self.definition.config.validate()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateState {
+    NotDetected,
     Waiting,
     InProgress,
     Completed,
     Failed,
     Unavailable,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertEventKind {
+    Missing,
+    Started,
+    Terminal,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AlertIntent {
-    pub source_identity: SourceIdentity,
-    pub title: String,
-    pub body: String,
+#[serde(tag = "event_kind", rename_all = "snake_case")]
+pub enum AlertIntent {
+    Missing {
+        after_seconds: u64,
+        title: String,
+        body: String,
+    },
+    Started {
+        source_identity: SourceIdentity,
+        title: String,
+        body: String,
+    },
+    Terminal {
+        source_identity: SourceIdentity,
+        title: String,
+        body: String,
+    },
+}
+impl AlertIntent {
+    pub const fn event_kind(&self) -> AlertEventKind {
+        match self {
+            Self::Missing { .. } => AlertEventKind::Missing,
+            Self::Started { .. } => AlertEventKind::Started,
+            Self::Terminal { .. } => AlertEventKind::Terminal,
+        }
+    }
+    pub fn source_identity(&self) -> Option<&SourceIdentity> {
+        match self {
+            Self::Missing { .. } => None,
+            Self::Started {
+                source_identity, ..
+            }
+            | Self::Terminal {
+                source_identity, ..
+            } => Some(source_identity),
+        }
+    }
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Missing { title, .. }
+            | Self::Started { title, .. }
+            | Self::Terminal { title, .. } => title,
+        }
+    }
+    pub fn body(&self) -> &str {
+        match self {
+            Self::Missing { body, .. }
+            | Self::Started { body, .. }
+            | Self::Terminal { body, .. } => body,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
@@ -396,11 +471,23 @@ pub struct Candidate {
 impl Candidate {
     pub fn validate(&self) -> Result<(), DomainError> {
         if let Some(intent) = &self.alert_intent {
-            let Some(source) = &self.source_identity else {
-                return Err(DomainError::MissingAlertSource);
-            };
-            if *source != intent.source_identity {
-                return Err(DomainError::AlertSourceMismatch);
+            if let AlertIntent::Missing {
+                after_seconds: 0, ..
+            } = intent
+            {
+                return Err(DomainError::InvalidMissingAlertDelay);
+            }
+            if intent.event_kind() == AlertEventKind::Missing {
+                if self.source_identity.is_some() {
+                    return Err(DomainError::MissingAlertHasSource);
+                }
+            } else {
+                let Some(source) = &self.source_identity else {
+                    return Err(DomainError::MissingAlertSource);
+                };
+                if Some(source) != intent.source_identity() {
+                    return Err(DomainError::AlertSourceMismatch);
+                }
             }
         }
         Ok(())
@@ -416,6 +503,8 @@ pub struct Observation {
     pub source_url: Option<String>,
     pub detail: Option<String>,
     pub observed_at: Timestamp,
+    pub first_observed_at: Timestamp,
+    pub first_source_seen_at: Option<Timestamp>,
 }
 impl From<&Candidate> for Observation {
     fn from(candidate: &Candidate) -> Self {
@@ -428,6 +517,11 @@ impl From<&Candidate> for Observation {
             source_url: candidate.source_url.clone(),
             detail: candidate.detail.clone(),
             observed_at: candidate.observed_at.clone(),
+            first_observed_at: candidate.observed_at.clone(),
+            first_source_seen_at: candidate
+                .source_identity
+                .as_ref()
+                .map(|_| candidate.observed_at.clone()),
         }
     }
 }
@@ -436,6 +530,7 @@ pub struct AlertKey {
     pub rule_id: RuleId,
     pub rule_version: RuleVersion,
     pub revision: Revision,
+    pub event_kind: AlertEventKind,
     pub source_identity: SourceIdentity,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,6 +563,11 @@ pub struct RuleHistory {
     pub watch_id: WatchId,
     pub rule_kind: RuleKind,
     pub latest_observation: Option<Observation>,
+    /// Timing state for the candidate revision passed to [`reconcile`], not necessarily the
+    /// revision in `latest_observation`.
+    pub first_observed_at: Option<Timestamp>,
+    /// Source timing state for the candidate revision passed to [`reconcile`].
+    pub first_source_seen_at: Option<Timestamp>,
     pub existing_alert_keys: BTreeSet<AlertKey>,
 }
 impl RuleHistory {
@@ -499,32 +599,126 @@ pub fn reconcile(
     history: RuleHistory,
 ) -> Result<Reconciliation, DomainError> {
     candidate.validate()?;
-    let observation = Observation::from(&candidate);
+    let (first_observed_at, first_source_seen_at) = reconciliation_timestamps(&candidate, &history);
+    let mut observation = Observation::from(&candidate);
+    observation.first_observed_at.clone_from(&first_observed_at);
+    observation
+        .first_source_seen_at
+        .clone_from(&first_source_seen_at);
     if !history.has_baseline() {
         return Ok(Reconciliation {
             observation,
             alert: None,
         });
     }
-    let alert = candidate.alert_intent.as_ref().and_then(|intent| {
-        let key = AlertKey {
-            rule_id: candidate.rule_key.rule_id.clone(),
-            rule_version: candidate.rule_key.rule_version,
-            revision: candidate.revision.clone(),
-            source_identity: intent.source_identity.clone(),
-        };
-        (!history.contains(&key)).then(|| AlertDraft {
-            key,
-            watch_id: history.watch_id.clone(),
-            subject_key: candidate.subject_key.clone(),
-            rule_kind: history.rule_kind,
-            title: intent.title.clone(),
-            body: intent.body.clone(),
-            source_url: candidate.source_url.clone(),
-            created_at: candidate.observed_at.clone(),
-        })
-    });
+    let alert = eligible_alert_intent(
+        &candidate,
+        &first_observed_at,
+        first_source_seen_at.as_ref(),
+    )
+    .and_then(|intent| alert_draft(&candidate, &history, intent));
     Ok(Reconciliation { observation, alert })
+}
+
+fn reconciliation_timestamps(
+    candidate: &Candidate,
+    history: &RuleHistory,
+) -> (Timestamp, Option<Timestamp>) {
+    let first_observed_at = history
+        .first_observed_at
+        .clone()
+        .or_else(|| {
+            history
+                .latest_observation
+                .as_ref()
+                .filter(|latest| latest.revision == candidate.revision)
+                .map(|latest| latest.first_observed_at.clone())
+        })
+        .unwrap_or_else(|| candidate.observed_at.clone());
+    let first_source_seen_at = history
+        .first_source_seen_at
+        .clone()
+        .or_else(|| {
+            history
+                .latest_observation
+                .as_ref()
+                .filter(|latest| latest.revision == candidate.revision)
+                .and_then(|latest| latest.first_source_seen_at.clone())
+        })
+        .or_else(|| {
+            candidate
+                .source_identity
+                .as_ref()
+                .map(|_| candidate.observed_at.clone())
+        });
+    (first_observed_at, first_source_seen_at)
+}
+
+fn eligible_alert_intent<'a>(
+    candidate: &'a Candidate,
+    first_observed_at: &Timestamp,
+    first_source_seen_at: Option<&Timestamp>,
+) -> Option<&'a AlertIntent> {
+    candidate
+        .alert_intent
+        .as_ref()
+        .filter(|intent| match intent {
+            AlertIntent::Missing { after_seconds, .. } => {
+                candidate.state == CandidateState::NotDetected
+                    && first_source_seen_at.is_none()
+                    && {
+                        candidate.observed_at.as_datetime() - first_observed_at.as_datetime()
+                            >= chrono::Duration::seconds(
+                                (*after_seconds).try_into().unwrap_or(i64::MAX),
+                            )
+                    }
+            }
+            AlertIntent::Started { .. } => {
+                matches!(
+                    candidate.state,
+                    CandidateState::Waiting | CandidateState::InProgress
+                )
+            }
+            AlertIntent::Terminal { .. } => {
+                matches!(
+                    candidate.state,
+                    CandidateState::Completed | CandidateState::Failed
+                )
+            }
+        })
+}
+
+fn alert_draft(
+    candidate: &Candidate,
+    history: &RuleHistory,
+    intent: &AlertIntent,
+) -> Option<AlertDraft> {
+    let source_identity = intent
+        .source_identity()
+        .cloned()
+        .unwrap_or_else(missing_alert_source_identity);
+    let key = AlertKey {
+        rule_id: candidate.rule_key.rule_id.clone(),
+        rule_version: candidate.rule_key.rule_version,
+        revision: candidate.revision.clone(),
+        event_kind: intent.event_kind(),
+        source_identity,
+    };
+    (!history.contains(&key)).then(|| AlertDraft {
+        key,
+        watch_id: history.watch_id.clone(),
+        subject_key: candidate.subject_key.clone(),
+        rule_kind: history.rule_kind,
+        title: intent.title().into(),
+        body: intent.body().into(),
+        source_url: candidate.source_url.clone(),
+        created_at: candidate.observed_at.clone(),
+    })
+}
+
+/// The key-only identity for a missing source. It is never exposed as an observation source.
+pub fn missing_alert_source_identity() -> SourceIdentity {
+    SourceIdentity("airborne:missing-check:v1".into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,7 +836,7 @@ mod tests {
             source_identity: source_identity.clone(),
             source_url: Some("https://example.test/source".into()),
             detail: None,
-            alert_intent: intent.then(|| AlertIntent {
+            alert_intent: intent.then(|| AlertIntent::Terminal {
                 source_identity: source_identity.unwrap(),
                 title: "done".into(),
                 body: "finished".into(),
@@ -655,14 +849,23 @@ mod tests {
             watch_id: WatchId::new("watch").unwrap(),
             rule_kind: RuleKind::GitHubCheckCompletes,
             latest_observation: None,
+            first_observed_at: None,
+            first_source_seen_at: None,
             existing_alert_keys: BTreeSet::new(),
         }
     }
     fn history(candidate: &Candidate) -> RuleHistory {
+        let observation = Observation::from(candidate);
         RuleHistory {
-            latest_observation: Some(Observation::from(candidate)),
+            first_observed_at: Some(observation.first_observed_at.clone()),
+            first_source_seen_at: observation.first_source_seen_at.clone(),
+            latest_observation: Some(observation),
             ..empty_history()
         }
+    }
+    fn at(mut candidate: Candidate, value: &str) -> Candidate {
+        candidate.observed_at = Timestamp::parse(value).unwrap();
+        candidate
     }
     fn reconcile_test(candidate: Candidate, history: RuleHistory) -> Reconciliation {
         reconcile(candidate, history).unwrap()
@@ -705,6 +908,7 @@ mod tests {
                         rule_id: RuleId::new("rule").unwrap(),
                         rule_version: RuleVersion::new(1).unwrap(),
                         revision: Revision::new("a").unwrap(),
+                        event_kind: AlertEventKind::Terminal,
                         source_identity: id("1"),
                     });
                     h
@@ -750,8 +954,195 @@ mod tests {
     #[test]
     fn alert_intent_requires_matching_source() {
         let mut candidate = candidate("a", Some("one"), true);
-        candidate.alert_intent.as_mut().unwrap().source_identity = id("two");
+        *candidate.alert_intent.as_mut().unwrap() = AlertIntent::Terminal {
+            source_identity: id("two"),
+            title: "done".into(),
+            body: "finished".into(),
+        };
         assert_eq!(candidate.validate(), Err(DomainError::AlertSourceMismatch));
+    }
+    #[test]
+    fn github_check_policy_defaults_when_reading_existing_config() {
+        let config: RuleConfig = serde_json::from_str(
+            r#"{"kind":"git_hub_check_completes","check_name":"Cursor Bugbot"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config,
+            RuleConfig::GitHubCheckCompletes {
+                check_name: "Cursor Bugbot".into(),
+                alert_on_start: false,
+                alert_if_missing_after_seconds: None,
+            }
+        );
+    }
+    #[test]
+    fn missing_delay_must_be_positive() {
+        assert_eq!(
+            RuleConfig::GitHubCheckCompletes {
+                check_name: "Cursor Bugbot".into(),
+                alert_on_start: false,
+                alert_if_missing_after_seconds: Some(0),
+            }
+            .validate(),
+            Err(DomainError::InvalidMissingAlertDelay)
+        );
+        let mut missing = candidate("a", None, false);
+        missing.alert_intent = Some(AlertIntent::Missing {
+            after_seconds: 0,
+            title: "missing".into(),
+            body: "missing".into(),
+        });
+        assert_eq!(
+            missing.validate(),
+            Err(DomainError::InvalidMissingAlertDelay)
+        );
+    }
+    #[test]
+    fn missing_alert_intent_cannot_have_a_provider_source() {
+        let mut missing = candidate("a", Some("run-1"), false);
+        missing.state = CandidateState::NotDetected;
+        missing.alert_intent = Some(AlertIntent::Missing {
+            after_seconds: 60,
+            title: "missing".into(),
+            body: "missing".into(),
+        });
+        assert_eq!(missing.validate(), Err(DomainError::MissingAlertHasSource));
+    }
+    #[test]
+    fn missing_alert_waits_for_its_delay_and_never_leaks_its_key_source() {
+        let mut baseline = candidate("a", None, false);
+        baseline.state = CandidateState::NotDetected;
+        let initial = reconcile_test(baseline.clone(), empty_history());
+        assert!(initial.alert.is_none());
+        let mut missing = at(baseline.clone(), "2026-09-08T12:01:00Z");
+        missing.alert_intent = Some(AlertIntent::Missing {
+            after_seconds: 60,
+            title: "missing".into(),
+            body: "missing".into(),
+        });
+        let reconciliation = reconcile_test(
+            missing,
+            RuleHistory {
+                latest_observation: Some(initial.observation.clone()),
+                first_observed_at: Some(initial.observation.first_observed_at.clone()),
+                first_source_seen_at: None,
+                ..empty_history()
+            },
+        );
+        let alert = reconciliation.alert.unwrap();
+        assert_eq!(alert.key.event_kind, AlertEventKind::Missing);
+        assert_eq!(alert.key.source_identity, missing_alert_source_identity());
+        assert_eq!(reconciliation.observation.source_identity, None);
+    }
+    #[test]
+    fn source_seen_suppresses_missing_alerts_for_the_revision() {
+        let seen = candidate("a", Some("run-1"), false);
+        let mut missing = at(candidate("a", None, false), "2026-09-08T12:01:00Z");
+        missing.state = CandidateState::NotDetected;
+        missing.alert_intent = Some(AlertIntent::Missing {
+            after_seconds: 1,
+            title: "missing".into(),
+            body: "missing".into(),
+        });
+        assert!(reconcile_test(missing, history(&seen)).alert.is_none());
+    }
+    #[test]
+    fn revisiting_a_revision_reuses_its_durable_missing_timer() {
+        let mut revision_a = candidate("a", None, false);
+        revision_a.state = CandidateState::NotDetected;
+        let initial_a = reconcile_test(revision_a.clone(), empty_history()).observation;
+        let revision_b = at(candidate("b", None, false), "2026-09-08T12:01:00Z");
+        let observation_b = reconcile_test(
+            revision_b,
+            RuleHistory {
+                latest_observation: Some(initial_a.clone()),
+                // The candidate is B, which has no prior timing state.
+                first_observed_at: None,
+                first_source_seen_at: None,
+                ..empty_history()
+            },
+        )
+        .observation;
+        let mut revisit_a = at(revision_a, "2026-09-08T12:03:00Z");
+        revisit_a.alert_intent = Some(AlertIntent::Missing {
+            after_seconds: 120,
+            title: "missing".into(),
+            body: "missing".into(),
+        });
+        let result = reconcile_test(
+            revisit_a,
+            RuleHistory {
+                latest_observation: Some(observation_b),
+                // Although B is latest, durable timing belongs to candidate revision A.
+                first_observed_at: Some(initial_a.first_observed_at.clone()),
+                first_source_seen_at: initial_a.first_source_seen_at.clone(),
+                ..empty_history()
+            },
+        );
+        assert_eq!(
+            result.observation.first_observed_at,
+            initial_a.first_observed_at
+        );
+        assert!(result.alert.is_some());
+    }
+    #[test]
+    fn started_and_terminal_events_are_distinct_and_state_gated() {
+        let baseline = candidate("a", None, false);
+        let mut started = candidate("a", Some("run-1"), false);
+        started.state = CandidateState::InProgress;
+        started.alert_intent = Some(AlertIntent::Started {
+            source_identity: id("run-1"),
+            title: "started".into(),
+            body: "started".into(),
+        });
+        let start_alert = reconcile_test(started.clone(), history(&baseline))
+            .alert
+            .unwrap();
+        assert_eq!(start_alert.key.event_kind, AlertEventKind::Started);
+        let mut terminal = candidate("a", Some("run-1"), false);
+        terminal.alert_intent = Some(AlertIntent::Terminal {
+            source_identity: id("run-1"),
+            title: "done".into(),
+            body: "done".into(),
+        });
+        let terminal_alert = reconcile_test(terminal.clone(), history(&started))
+            .alert
+            .unwrap();
+        assert_eq!(terminal_alert.key.event_kind, AlertEventKind::Terminal);
+        terminal.alert_intent = Some(AlertIntent::Started {
+            source_identity: id("run-1"),
+            title: "started".into(),
+            body: "started".into(),
+        });
+        assert!(reconcile_test(terminal, history(&started)).alert.is_none());
+    }
+    #[test]
+    fn alert_identity_includes_event_and_source() {
+        let baseline = candidate("a", None, false);
+        let mut started = candidate("a", Some("run-2"), false);
+        started.state = CandidateState::Waiting;
+        started.alert_intent = Some(AlertIntent::Started {
+            source_identity: id("run-2"),
+            title: "started".into(),
+            body: "started".into(),
+        });
+        let first = reconcile_test(started.clone(), history(&baseline))
+            .alert
+            .unwrap();
+        let mut prior = history(&started);
+        prior.existing_alert_keys.insert(first.key);
+        assert!(reconcile_test(started.clone(), prior).alert.is_none());
+        let mut another_source = started;
+        another_source.source_identity = Some(id("run-3"));
+        another_source.alert_intent = Some(AlertIntent::Started {
+            source_identity: id("run-3"),
+            title: "started".into(),
+            body: "started".into(),
+        });
+        assert!(reconcile_test(another_source, history(&baseline))
+            .alert
+            .is_some());
     }
     #[test]
     fn multi_job_identity_is_order_independent_and_versioned() {

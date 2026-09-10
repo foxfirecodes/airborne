@@ -22,6 +22,8 @@ fn at(second: u8) -> Timestamp {
 fn config(name: &str) -> RuleConfig {
     RuleConfig::GitHubCheckCompletes {
         check_name: name.into(),
+        alert_on_start: false,
+        alert_if_missing_after_seconds: None,
     }
 }
 
@@ -39,6 +41,10 @@ enum Response {
         state: CandidateState,
         source: Option<&'static str>,
         intent: bool,
+    },
+    Missing {
+        revision: &'static str,
+        after_seconds: u64,
     },
     Issue,
 }
@@ -71,10 +77,37 @@ impl SubjectMonitor for ScriptedMonitor {
                     source_identity: source_identity.clone(),
                     source_url: Some("https://example.test/check".into()),
                     detail: Some("test result".into()),
-                    alert_intent: intent.then(|| AlertIntent {
+                    alert_intent: intent.then(|| AlertIntent::Terminal {
                         source_identity: source_identity.unwrap(),
                         title: "check finished".into(),
                         body: "test result".into(),
+                    }),
+                    observed_at: self.observed_at.clone(),
+                };
+                MonitorReport {
+                    subject_key: request.subject.key,
+                    metadata: None,
+                    revision: Some(candidate.revision.clone()),
+                    results: vec![RulePollResult::Candidate(candidate)],
+                    subject_issue: None,
+                }
+            }
+            Response::Missing {
+                revision,
+                after_seconds,
+            } => {
+                let candidate = Candidate {
+                    rule_key: request.rules[0].key(),
+                    subject_key: request.subject.key.clone(),
+                    revision: Revision::new(revision).unwrap(),
+                    state: CandidateState::NotDetected,
+                    source_identity: None,
+                    source_url: None,
+                    detail: None,
+                    alert_intent: Some(AlertIntent::Missing {
+                        after_seconds,
+                        title: "check missing".into(),
+                        body: "check has not appeared".into(),
                     }),
                     observed_at: self.observed_at.clone(),
                 };
@@ -168,10 +201,13 @@ async fn alerts(path: &Path) -> usize {
 async fn latest_observation(path: &Path, rule: RuleId, version: u64) -> airborne_core::Observation {
     let store = SqliteStore::open(path).unwrap();
     store
-        .load_rule_history(&[RuleKey {
-            rule_id: rule,
-            rule_version: airborne_core::RuleVersion::new(version).unwrap(),
-        }])
+        .load_rule_history(&[(
+            RuleKey {
+                rule_id: rule,
+                rule_version: airborne_core::RuleVersion::new(version).unwrap(),
+            },
+            airborne_core::Revision::new("a").unwrap(),
+        )])
         .await
         .unwrap()
         .0
@@ -425,4 +461,90 @@ async fn source_issue_after_restart_keeps_last_observation() {
 
     assert_eq!(refresh(&path, Response::Issue, at(2)).await, 0);
     assert_eq!(latest_observation(&path, rule, 1).await, before);
+}
+
+#[tokio::test]
+async fn source_first_seen_time_survives_same_revision_source_transitions_and_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("airborne.sqlite");
+    let (_, rule) = setup(&path).await;
+
+    for (second, state, source) in [
+        (1, CandidateState::NotDetected, None),
+        (2, CandidateState::Waiting, Some("check-a")),
+        (3, CandidateState::NotDetected, None),
+    ] {
+        refresh(
+            &path,
+            Response::Candidate {
+                revision: "a",
+                state,
+                source,
+                intent: false,
+            },
+            at(second),
+        )
+        .await;
+    }
+
+    let observation = latest_observation(&path, rule, 1).await;
+    assert_eq!(observation.first_observed_at, at(1));
+    assert_eq!(observation.first_source_seen_at, Some(at(2)));
+}
+
+#[tokio::test]
+async fn revisiting_a_revision_keeps_its_missing_deadline_after_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("airborne.sqlite");
+    let (_, rule) = setup(&path).await;
+    SqliteStore::open(&path)
+        .unwrap()
+        .update_rule(RuleChange {
+            id: rule,
+            config: RuleConfig::GitHubCheckCompletes {
+                check_name: "ci".into(),
+                alert_on_start: false,
+                alert_if_missing_after_seconds: Some(2),
+            },
+            at: at(0),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        refresh(
+            &path,
+            Response::Missing {
+                revision: "a",
+                after_seconds: 2,
+            },
+            at(1),
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        refresh(
+            &path,
+            Response::Missing {
+                revision: "b",
+                after_seconds: 2,
+            },
+            at(2),
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        refresh(
+            &path,
+            Response::Missing {
+                revision: "a",
+                after_seconds: 2,
+            },
+            at(3),
+        )
+        .await,
+        1
+    );
 }

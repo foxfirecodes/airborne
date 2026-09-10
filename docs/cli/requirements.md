@@ -3,7 +3,9 @@
 ## 1. Goal
 
 Ship a reliable local CLI that watches the current revision of a GitHub pull
-request and records an alert when either of these events occurs:
+request and records an alert when a selected check or Buildkite job finishes.
+A Bugbot rule may also alert when its exact check starts or stays undetected
+past its configured grace period:
 
 - a named GitHub check, initially `Cursor Bugbot`, completes;
 - a selected job in the Buildkite build linked from GitHub reaches the chosen
@@ -127,7 +129,9 @@ airborne watch remove <WATCH_ID> [--yes]
 ### 3.4 Rule commands
 
 ```text
-airborne rule add bugbot <WATCH_ID> [--check-name <NAME>]
+airborne rule add bugbot <WATCH_ID> [--check-name <NAME>] \
+  [--alert-on-start] \
+  [--alert-if-missing-after <DURATION>]
 
 airborne rule add buildkite-job <WATCH_ID> \
   --context <GITHUB_STATUS_CONTEXT> \
@@ -140,11 +144,20 @@ airborne rule list [--watch <WATCH_ID>] [--enabled|--all]
 airborne rule show <RULE_ID>
 airborne rule enable <RULE_ID>
 airborne rule disable <RULE_ID>
-airborne rule update <RULE_ID> [KIND-SPECIFIC OPTIONS]
+airborne rule update <RULE_ID> [KIND-SPECIFIC OPTIONS] \
+  [--alert-on-start|--no-alert-on-start] \
+  [--alert-if-missing-after <DURATION>|--no-alert-if-missing-after]
 airborne rule remove <RULE_ID> [--yes]
 ```
 
 - The default Bugbot check name must be `Cursor Bugbot`.
+- Bugbot completion alerts are on by default. Start and missing alerts are off
+  by default.
+- `--alert-on-start` enables a start alert and `--no-alert-on-start` disables
+  it. `rule update` must support both so a user can make an explicit choice.
+- `--alert-if-missing-after` enables a missing alert after the given positive
+  duration. `--no-alert-if-missing-after` disables it. A rule add has no
+  missing threshold unless this flag is supplied.
 - Buildkite context, organization, pipeline, and job name must use exact,
   case-sensitive matching.
 - `--notify-on` must default to `terminal`.
@@ -155,6 +168,9 @@ airborne rule remove <RULE_ID> [--yes]
   result becomes a baseline, so time spent disabled cannot cause a late alert.
 - Disabling a rule must retain its history and current version.
 - `rule remove` must archive the rule and retain its alerts and observations.
+- A watch may have at most one non-archived rule of each rule kind. Disabled
+  rules still occupy that slot; archiving a rule frees it. Adding a duplicate
+  must fail with a conflict that identifies the existing rule.
 
 The CLI does not require a separate pipeline-mapping record. A Buildkite rule
 contains the full expected context and pipeline identity. This removes a UI
@@ -199,7 +215,13 @@ airborne alerts acknowledge --all [--yes]
 ```
 
 - `status` must show the current revision, last poll outcome, enabled rules,
-  latest successful evaluation, and current source issue.
+  latest successful evaluation, current rule state, and current source issue.
+  Current rule state is one of `not_detected`, `waiting`, `in_progress`,
+  `completed`, `failed`, or `unavailable` when a successful evaluation exists.
+- Human status must name a `not_detected` rule as not detected, a `waiting`
+  rule as waiting, and an `in_progress` rule as in progress. JSON status must
+  expose the exact snake-case state in a stable field. Both forms must show
+  the observation time when one exists.
 - A source issue must not replace the last successful evaluation.
 - Alerts are immutable event records. Acknowledgement is the only mutable alert
   field exposed by version 1.
@@ -314,6 +336,11 @@ codes rather than `1`.
 - SQLite must enable foreign keys, a busy timeout, and WAL mode where supported.
 - Every schema change must have an upgrade test from each supported released
   schema. Migrations must never silently discard user data.
+- The migration that adds the one-rule-per-kind invariant must preserve every
+  legacy rule and all related history. For each watch and rule kind, it must
+  deterministically keep the earliest rule and archive later duplicates, using
+  a stable ordering such as creation time then rule ID. It must record each
+  repair so status, diagnostics, and future migrations can explain it.
 - Logs, errors, JSON output, fixtures, and panic messages must not contain
   credentials.
 - URLs supplied by providers must be parsed and checked before use. Airborne
@@ -368,7 +395,8 @@ domain rule, component, and planned test.
 - Create the Cargo workspace and shared crate skeletons.
 - Implement domain value types and the pure reconciliation function.
 - Cover first baseline, same-revision transition, new revision, rule change,
-  re-enable, unavailable state, and deduplication.
+  re-enable, unavailable state, missing/start/terminal alerts, and
+  deduplication.
 
 Complete when core tests need no network, database, async runtime, or CLI.
 
@@ -391,8 +419,9 @@ isolation failures, and monitor tests use fake provider ports.
   `alerts` commands.
 - Complete one real Bugbot and one real Buildkite read-only refresh.
 
-Complete when a fresh data directory can go from `watch add` to a durable alert
-and repeat refreshes create no duplicate.
+Complete when a fresh data directory can go from `watch add` to durable
+missing, start, and terminal alerts as configured, and repeat refreshes create
+no duplicate.
 
 ### Milestone 4: long-running and operational UX
 
@@ -424,11 +453,16 @@ Airborne version 1 is complete only when all of these statements are true:
    documented output and exit contract.
 2. Every lifecycle rule in the domain model has a pure table test and a
    SQLite-backed restart test.
+   This includes missing-delay persistence and suppression after a source is
+   seen, no retroactive start alert for a first observed terminal result, and
+   event-kind alert deduplication.
 3. Captured contract tests cover successful and failed GitHub and Buildkite
    responses, paging, missing fields, unknown states, and rate limits.
 4. One source failure cannot block valid results from another source or watch.
 5. Two Buildkite rules for one build cause one Buildkite request per refresh.
-6. Repeated polls and process restarts cannot create duplicate alerts.
+6. Repeated polls and process restarts cannot create duplicate alerts. A watch
+   cannot retain two non-archived rules of the same kind, including after
+   upgrade repair.
 7. Credentials never appear in stdout, stderr, logs, snapshots, fixtures, the
    database, or crash output.
 8. Database migration, interrupted-write, corrupt-input, and concurrent-process
@@ -483,6 +517,12 @@ handlers in process. Test cases must include:
 - no-color and non-interactive behavior;
 - each public exit code;
 - first baseline and later completion;
+- `not_detected`, `waiting`, `in_progress`, and terminal status rendering in
+  both human and JSON forms;
+- missing threshold elapsed across restart, missing alert once, and permanent
+  missing suppression after the source appears on that revision;
+- configured start alert once, terminal alert after start, and a terminal
+  result first seen without a retroactive start alert;
 - a new revision already complete on first poll;
 - rule update and re-enable baselines;
 - partial provider failure with saved valid work;

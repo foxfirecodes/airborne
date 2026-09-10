@@ -12,22 +12,22 @@ use std::{
 };
 
 use airborne_core::{
-    Alert, AlertId, AlertKey, CandidateState, Observation, Rule, RuleConfig, RuleDefinition,
-    RuleHistory, RuleHistorySet, RuleId, RuleKey, RuleKind, RuleVersion, SourceIdentity, Subject,
-    SubjectKey, Timestamp, VersionedRule, Watch, WatchId, WatchState,
+    Alert, AlertEventKind, AlertId, AlertKey, CandidateState, Observation, Rule, RuleConfig,
+    RuleDefinition, RuleHistory, RuleHistorySet, RuleId, RuleKey, RuleKind, RuleVersion,
+    SourceIdentity, Subject, SubjectKey, Timestamp, VersionedRule, Watch, WatchId, WatchState,
 };
 use airborne_runtime::{
     LeaseError, LeaseGuard, LeaseStore, RefreshLease, RefreshScope, RefreshTarget, RunnerLease,
     RuntimeStore, StoreError,
 };
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const LATEST_SCHEMA: i64 = 4;
+const LATEST_SCHEMA: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
@@ -275,7 +275,7 @@ impl SqliteStore {
     }
     pub fn get_alert(&self, id: &AlertId) -> Result<Option<Alert>> {
         let c = self.connection.lock().expect("SQLite mutex poisoned");
-        let mut statement=c.prepare("SELECT a.id,a.rule_id,a.rule_version,a.revision,a.source_identity,r.watch_id,s.subject_key,r.kind,a.title,a.body,a.source_url,a.created_at,a.acknowledged_at FROM alert a JOIN rule r ON r.id=a.rule_id JOIN watch w ON w.id=r.watch_id JOIN subject s ON s.id=w.subject_id WHERE a.id=?").map_err(SqliteStoreError::Storage)?;
+        let mut statement=c.prepare("SELECT a.id,a.rule_id,a.rule_version,a.revision,a.event_kind,a.source_identity,r.watch_id,s.subject_key,r.kind,a.title,a.body,a.source_url,a.created_at,a.acknowledged_at FROM alert a JOIN rule r ON r.id=a.rule_id JOIN watch w ON w.id=r.watch_id JOIN subject s ON s.id=w.subject_id WHERE a.id=?").map_err(SqliteStoreError::Storage)?;
         let mut rows = statement
             .query([id.as_str()])
             .map_err(SqliteStoreError::Storage)?;
@@ -286,15 +286,16 @@ impl SqliteStore {
         let rule: String = row.get(1).map_err(SqliteStoreError::Storage)?;
         let version: u64 = row.get(2).map_err(SqliteStoreError::Storage)?;
         let revision: String = row.get(3).map_err(SqliteStoreError::Storage)?;
-        let source: String = row.get(4).map_err(SqliteStoreError::Storage)?;
-        let watch: String = row.get(5).map_err(SqliteStoreError::Storage)?;
-        let subject: String = row.get(6).map_err(SqliteStoreError::Storage)?;
-        let kind: String = row.get(7).map_err(SqliteStoreError::Storage)?;
-        let title: String = row.get(8).map_err(SqliteStoreError::Storage)?;
-        let body: String = row.get(9).map_err(SqliteStoreError::Storage)?;
-        let source_url: Option<String> = row.get(10).map_err(SqliteStoreError::Storage)?;
-        let created: String = row.get(11).map_err(SqliteStoreError::Storage)?;
-        let acknowledged: Option<String> = row.get(12).map_err(SqliteStoreError::Storage)?;
+        let event_kind: String = row.get(4).map_err(SqliteStoreError::Storage)?;
+        let source: String = row.get(5).map_err(SqliteStoreError::Storage)?;
+        let watch: String = row.get(6).map_err(SqliteStoreError::Storage)?;
+        let subject: String = row.get(7).map_err(SqliteStoreError::Storage)?;
+        let kind: String = row.get(8).map_err(SqliteStoreError::Storage)?;
+        let title: String = row.get(9).map_err(SqliteStoreError::Storage)?;
+        let body: String = row.get(10).map_err(SqliteStoreError::Storage)?;
+        let source_url: Option<String> = row.get(11).map_err(SqliteStoreError::Storage)?;
+        let created: String = row.get(12).map_err(SqliteStoreError::Storage)?;
+        let acknowledged: Option<String> = row.get(13).map_err(SqliteStoreError::Storage)?;
         Ok(Some(Alert {
             id: AlertId::new(id).map_err(|e| SqliteStoreError::Import(e.to_string()))?,
             key: AlertKey {
@@ -302,6 +303,8 @@ impl SqliteStore {
                 rule_version: RuleVersion::new(version)
                     .map_err(|e| SqliteStoreError::Import(e.to_string()))?,
                 revision: airborne_core::Revision::new(revision)
+                    .map_err(|e| SqliteStoreError::Import(e.to_string()))?,
+                event_kind: parse_alert_event_kind(event_kind)
                     .map_err(|e| SqliteStoreError::Import(e.to_string()))?,
                 source_identity: SourceIdentity::new(source)
                     .map_err(|e| SqliteStoreError::Import(e.to_string()))?,
@@ -373,7 +376,7 @@ impl SqliteStore {
             let mut statuses = Vec::new();
             for rule in rows {
                 let rule = rule.map_err(SqliteStoreError::Storage)?;
-                let observation=c.query_row("SELECT rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at FROM observation WHERE rule_id=? AND rule_version=? ORDER BY observed_at DESC,id DESC LIMIT 1",params![rule.id.as_str(),rule.current_version.get()],|r| {let id:String=r.get(0)?;let version:u64=r.get(1)?;let revision:String=r.get(2)?;let state:String=r.get(3)?;let source:Option<String>=r.get(4)?;let url:Option<String>=r.get(5)?;let detail:Option<String>=r.get(6)?;let at:String=r.get(7)?;Ok(Observation{rule_id:RuleId::new(id).map_err(domain_sql)?,rule_version:RuleVersion::new(version).map_err(domain_sql)?,revision:airborne_core::Revision::new(revision).map_err(domain_sql)?,state:parse_state(state).map_err(store_sql)?,source_identity:source.map(SourceIdentity::new).transpose().map_err(domain_sql)?,source_url:url,detail,observed_at:text_timestamp(at).map_err(store_sql)?})}).optional().map_err(SqliteStoreError::Storage)?;
+                let observation=c.query_row("SELECT rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at,first_observed_at,first_source_seen_at FROM observation WHERE rule_id=? AND rule_version=? ORDER BY observed_at DESC,id DESC LIMIT 1",params![rule.id.as_str(),rule.current_version.get()],|r| {let id:String=r.get(0)?;let version:u64=r.get(1)?;let revision:String=r.get(2)?;let state:String=r.get(3)?;let source:Option<String>=r.get(4)?;let url:Option<String>=r.get(5)?;let detail:Option<String>=r.get(6)?;let at:String=r.get(7)?;let first:String=r.get(8)?;let first_source:Option<String>=r.get(9)?;Ok(Observation{rule_id:RuleId::new(id).map_err(domain_sql)?,rule_version:RuleVersion::new(version).map_err(domain_sql)?,revision:airborne_core::Revision::new(revision).map_err(domain_sql)?,state:parse_state(state).map_err(store_sql)?,source_identity:source.map(SourceIdentity::new).transpose().map_err(domain_sql)?,source_url:url,detail,observed_at:text_timestamp(at).map_err(store_sql)?,first_observed_at:text_timestamp(first).map_err(store_sql)?,first_source_seen_at:first_source.map(text_timestamp).transpose().map_err(store_sql)?})}).optional().map_err(SqliteStoreError::Storage)?;
                 let issue=c.query_row("SELECT si.scope,si.provider,si.kind,si.retryable,si.message FROM source_issue si JOIN poll_attempt pa ON pa.id=si.poll_attempt_id WHERE si.rule_id=? AND pa.watch_id=? AND pa.id=(SELECT id FROM poll_attempt WHERE watch_id=? ORDER BY finished_at DESC,id DESC LIMIT 1) ORDER BY si.id DESC LIMIT 1",params![rule.id.as_str(),watch.id.as_str(),watch.id.as_str()],|r|Ok(StatusIssue{scope:r.get(0)?,provider:r.get(1)?,kind:r.get(2)?,retryable:r.get(3)?,safe_message:r.get(4)?})).optional().map_err(SqliteStoreError::Storage)?;
                 statuses.push(RuleStatus {
                     rule,
@@ -468,7 +471,7 @@ impl SqliteStore {
             if tx.execute("INSERT OR IGNORE INTO watch(id,subject_id,state,created_at,updated_at) VALUES (?,? ,?, ?, ?)",params![id,subject,if active{"active"}else{"paused"},created,created]).map_err(SqliteStoreError::Storage)?==1 {report.watches+=1; imported_watches.insert(old_watch,id);}
         }
         let mut rules = old
-            .prepare("SELECT id,watch_id,kind,config_json,enabled,created_at FROM rule")
+            .prepare("SELECT id,watch_id,kind,config_json,enabled,created_at FROM rule ORDER BY created_at,id")
             .map_err(|e| SqliteStoreError::Import(e.to_string()))?;
         let old_rules = rules
             .query_map([], |r| {
@@ -483,6 +486,7 @@ impl SqliteStore {
             })
             .map_err(|e| SqliteStoreError::Import(e.to_string()))?;
         let mut imported_rules = BTreeMap::new();
+        let mut imported_live_rules = BTreeMap::new();
         for row in old_rules {
             let (old_rule, old_watch, kind, json, enabled, created) =
                 row.map_err(|e| SqliteStoreError::Import(e.to_string()))?;
@@ -499,7 +503,7 @@ impl SqliteStore {
             };
             let config = match kind.as_str() {
                 "cursor_bugbot_completed" => {
-                    serde_json::json!({"kind":"git_hub_check_completes","check_name":value.get("check_name").and_then(|x|x.as_str()).unwrap_or("Cursor Bugbot")})
+                    serde_json::json!({"kind":"git_hub_check_completes","check_name":value.get("check_name").and_then(|x|x.as_str()).unwrap_or("Cursor Bugbot"),"alert_on_start":value.get("alert_on_start").and_then(|x|x.as_bool()).unwrap_or(false),"alert_if_missing_after_seconds":value.get("alert_if_missing_after_seconds").and_then(|x|x.as_u64())})
                 }
                 "buildkite_job_completed" => {
                     serde_json::json!({"kind":"buildkite_job_completes","github_status_context":value.get("github_status_context").and_then(|x|x.as_str()).unwrap_or(""),"expected_organization":value.get("organization").and_then(|x|x.as_str()).unwrap_or(""),"expected_pipeline":value.get("pipeline").and_then(|x|x.as_str()).unwrap_or(""),"job_name":value.get("job_name").and_then(|x|x.as_str()).unwrap_or(""),"notify_on":value.get("notify_on").and_then(|x|x.as_str()).unwrap_or("terminal")})
@@ -513,14 +517,32 @@ impl SqliteStore {
                 report.skipped += 1;
                 continue;
             };
-            let id = uid("rule");
-            let kind = if kind == "cursor_bugbot_completed" {
-                "github_check_completes"
-            } else {
-                "buildkite_job_completes"
+            let config: RuleConfig = match serde_json::from_value::<RuleConfig>(config.clone()) {
+                Ok(config) if config.validate().is_ok() => config,
+                _ => {
+                    report.skipped += 1;
+                    continue;
+                }
             };
-            tx.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)",params![id,watch,kind,enabled,created,created]).map_err(SqliteStoreError::Storage)?;
+            let id = uid("rule");
+            let kind = rule_kind_text(config.kind());
+            let duplicate_of = imported_live_rules
+                .get(&(watch.clone(), kind.to_owned()))
+                .cloned();
+            let state = if duplicate_of.is_some() {
+                "archived"
+            } else {
+                "active"
+            };
+            tx.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at,archived_at) VALUES (?,?,?,?,1,?,?,?,?)",params![id,watch,kind,if duplicate_of.is_some(){false}else{enabled},state,created,created,if duplicate_of.is_some(){Some(created.clone())}else{None}]).map_err(SqliteStoreError::Storage)?;
             tx.execute("INSERT INTO rule_definition(rule_id,version,encoding_version,definition,created_at) VALUES (?,1,1,?,?)",params![id,serde_json::to_string(&config).map_err(|e|SqliteStoreError::Import(e.to_string()))?,created]).map_err(SqliteStoreError::Storage)?;
+            if let Some(surviving_rule_id) = duplicate_of {
+                tx.execute("INSERT INTO migration_repair(migration_version,surviving_rule_id,archived_rule_id,reason,repaired_at) VALUES (5,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))", params![surviving_rule_id, id, "prototype duplicate rule kind; kept earliest created_at then id"]).map_err(SqliteStoreError::Storage)?;
+                tx.execute("UPDATE rule SET updated_at=(SELECT repaired_at FROM migration_repair WHERE archived_rule_id=?),archived_at=(SELECT repaired_at FROM migration_repair WHERE archived_rule_id=?) WHERE id=?", params![id, id, id]).map_err(SqliteStoreError::Storage)?;
+                report.repaired += 1;
+            } else {
+                imported_live_rules.insert((watch.clone(), kind.to_owned()), id.clone());
+            }
             imported_rules.insert(old_rule, id);
             report.rules += 1;
         }
@@ -552,7 +574,7 @@ impl SqliteStore {
                 report.skipped += 1;
                 continue;
             };
-            if tx.execute("INSERT OR IGNORE INTO observation(rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at) VALUES (?,1,?,?,?,?,?,?)",params![rule,revision,state,source,url,detail,at]).map_err(SqliteStoreError::Storage)?==1{report.observations+=1;}
+            if tx.execute("INSERT OR IGNORE INTO observation(rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at,first_observed_at,first_source_seen_at) VALUES (?,1,?,?,?,?,?,?,?,?)",params![rule,revision,state,source,url,detail,at,at,if source.is_some() { Some(at.clone()) } else { None }]).map_err(SqliteStoreError::Storage)?==1{report.observations+=1;}
         }
         let mut alerts = old
             .prepare(
@@ -588,7 +610,7 @@ impl SqliteStore {
                 }
             };
             let (watch, subject, rule_kind):(String,String,String)=tx.query_row("SELECT r.watch_id,s.subject_key,r.kind FROM rule r JOIN watch w ON w.id=r.watch_id JOIN subject s ON s.id=w.subject_id WHERE r.id=?",[rule],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(SqliteStoreError::Storage)?;
-            if tx.execute("INSERT OR IGNORE INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,source_identity,title,body,status,created_at,acknowledged_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",params![uid("alert"),rule,watch,subject,rule_kind,revision,source,title,body,new_status,created,ack]).map_err(SqliteStoreError::Storage)?==1{report.alerts+=1;}
+            if tx.execute("INSERT OR IGNORE INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,created_at,acknowledged_at) VALUES (?, ?, 1, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?)",params![uid("alert"),rule,watch,subject,rule_kind,revision,source,title,body,new_status,created,ack]).map_err(SqliteStoreError::Storage)?==1{report.alerts+=1;}
         }
         if let Some(settings) = old
             .query_row("SELECT value FROM setting WHERE key='settings'", [], |r| {
@@ -648,6 +670,7 @@ fn now_epoch() -> i64 {
 }
 fn state_text(value: CandidateState) -> &'static str {
     match value {
+        CandidateState::NotDetected => "not_detected",
         CandidateState::Waiting => "waiting",
         CandidateState::InProgress => "in_progress",
         CandidateState::Completed => "completed",
@@ -657,6 +680,7 @@ fn state_text(value: CandidateState) -> &'static str {
 }
 fn parse_state(value: String) -> std::result::Result<CandidateState, StoreError> {
     match value.as_str() {
+        "not_detected" => Ok(CandidateState::NotDetected),
         "waiting" => Ok(CandidateState::Waiting),
         "in_progress" => Ok(CandidateState::InProgress),
         "completed" => Ok(CandidateState::Completed),
@@ -693,6 +717,21 @@ fn parse_rule_kind(value: String) -> std::result::Result<RuleKind, StoreError> {
         _ => Err(store_error("database has an unknown rule kind")),
     }
 }
+fn alert_event_kind_text(value: AlertEventKind) -> &'static str {
+    match value {
+        AlertEventKind::Missing => "missing",
+        AlertEventKind::Started => "started",
+        AlertEventKind::Terminal => "terminal",
+    }
+}
+fn parse_alert_event_kind(value: String) -> std::result::Result<AlertEventKind, StoreError> {
+    match value.as_str() {
+        "missing" => Ok(AlertEventKind::Missing),
+        "started" => Ok(AlertEventKind::Started),
+        "terminal" => Ok(AlertEventKind::Terminal),
+        _ => Err(store_error("database has an unknown alert event kind")),
+    }
+}
 fn text_timestamp(value: String) -> std::result::Result<Timestamp, StoreError> {
     Timestamp::parse(&value).map_err(store_error)
 }
@@ -701,6 +740,22 @@ fn sql_timestamp(value: &Timestamp) -> String {
 }
 fn uid(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
+}
+fn existing_live_rule(
+    tx: &Transaction<'_>,
+    watch_id: &WatchId,
+    kind: RuleKind,
+) -> std::result::Result<Option<RuleId>, StoreError> {
+    tx.query_row(
+        "SELECT id FROM rule WHERE watch_id=? AND kind=? AND state != 'archived' ORDER BY created_at,id LIMIT 1",
+        params![watch_id.as_str(), rule_kind_text(kind)],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(store_error)?
+    .map(RuleId::new)
+    .transpose()
+    .map_err(store_error)
 }
 
 fn read_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<Watch> {
@@ -832,6 +887,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .map_err(SqliteStoreError::Storage)?;
         tx.execute("INSERT INTO schema_migration(version) VALUES (4)", [])
             .map_err(SqliteStoreError::Storage)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (5)", [])
+            .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     } else if current == 1 {
         let tx = connection
@@ -847,6 +904,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         tx.execute_batch("ALTER TABLE alert ADD COLUMN watch_id TEXT; ALTER TABLE alert ADD COLUMN subject_key TEXT; ALTER TABLE alert ADD COLUMN rule_kind TEXT;").map_err(SqliteStoreError::Storage)?;
         tx.execute("INSERT INTO schema_migration(version) VALUES (4)", [])
             .map_err(SqliteStoreError::Storage)?;
+        migrate_v5(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (5)", [])
+            .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     }
     if current == 2 {
@@ -859,6 +919,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         tx.execute_batch("ALTER TABLE alert ADD COLUMN watch_id TEXT; ALTER TABLE alert ADD COLUMN subject_key TEXT; ALTER TABLE alert ADD COLUMN rule_kind TEXT;").map_err(SqliteStoreError::Storage)?;
         tx.execute("INSERT INTO schema_migration(version) VALUES (4)", [])
             .map_err(SqliteStoreError::Storage)?;
+        migrate_v5(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (5)", [])
+            .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     }
     if current == 3 {
@@ -868,9 +931,84 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         tx.execute_batch("ALTER TABLE alert ADD COLUMN watch_id TEXT; ALTER TABLE alert ADD COLUMN subject_key TEXT; ALTER TABLE alert ADD COLUMN rule_kind TEXT;").map_err(SqliteStoreError::Storage)?;
         tx.execute("INSERT INTO schema_migration(version) VALUES (4)", [])
             .map_err(SqliteStoreError::Storage)?;
+        migrate_v5(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (5)", [])
+            .map_err(SqliteStoreError::Storage)?;
+        tx.commit().map_err(SqliteStoreError::Storage)?;
+    }
+    if current == 4 {
+        let tx = connection
+            .transaction()
+            .map_err(SqliteStoreError::Storage)?;
+        migrate_v5(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (5)", [])
+            .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     }
     Ok(())
+}
+
+fn migrate_v5(tx: &Transaction<'_>) -> Result<()> {
+    let has_observation: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='observation')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(SqliteStoreError::Storage)?;
+    let has_rule: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='rule')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(SqliteStoreError::Storage)?;
+    let has_rule_definition: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='rule_definition')", [], |row| row.get(0)).map_err(SqliteStoreError::Storage)?;
+    if has_observation {
+        tx.execute_batch("ALTER TABLE observation ADD COLUMN first_observed_at TEXT; ALTER TABLE observation ADD COLUMN first_source_seen_at TEXT; UPDATE observation SET first_observed_at=observed_at WHERE first_observed_at IS NULL; UPDATE observation SET first_source_seen_at=observed_at WHERE source_identity IS NOT NULL AND first_source_seen_at IS NULL;").map_err(SqliteStoreError::Storage)?;
+    }
+    if !has_rule || !has_rule_definition {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE migration_repair (id INTEGER PRIMARY KEY, migration_version INTEGER NOT NULL, surviving_rule_id TEXT NOT NULL, archived_rule_id TEXT NOT NULL UNIQUE, reason TEXT NOT NULL, repaired_at TEXT NOT NULL); \
+         CREATE TABLE alert_v5 (id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES rule(id), rule_version INTEGER NOT NULL, watch_id TEXT NOT NULL REFERENCES watch(id), subject_key TEXT NOT NULL, rule_kind TEXT NOT NULL, revision TEXT NOT NULL, event_kind TEXT NOT NULL CHECK(event_kind IN ('missing','started','terminal')), source_identity TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','acknowledged')), source_url TEXT, created_at TEXT NOT NULL, acknowledged_at TEXT, UNIQUE(rule_id, rule_version, revision, event_kind, source_identity), FOREIGN KEY(rule_id, rule_version) REFERENCES rule_definition(rule_id, version)); \
+         UPDATE alert SET watch_id=(SELECT watch_id FROM rule WHERE rule.id=alert.rule_id) WHERE watch_id IS NULL; \
+         UPDATE alert SET rule_kind=(SELECT kind FROM rule WHERE rule.id=alert.rule_id) WHERE rule_kind IS NULL; \
+         UPDATE alert SET subject_key=(SELECT subject.subject_key FROM rule JOIN watch ON watch.id=rule.watch_id JOIN subject ON subject.id=watch.subject_id WHERE rule.id=alert.rule_id) WHERE subject_key IS NULL; \
+         INSERT INTO alert_v5(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,source_url,created_at,acknowledged_at) SELECT id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,'terminal',source_identity,title,body,status,source_url,created_at,acknowledged_at FROM alert; \
+         DROP TABLE alert; ALTER TABLE alert_v5 RENAME TO alert; \
+         CREATE INDEX alert_created ON alert(created_at DESC);",
+    ).map_err(SqliteStoreError::Storage)?;
+    let mut statement = tx.prepare("SELECT watch_id,kind,id FROM rule WHERE state != 'archived' ORDER BY watch_id,kind,created_at,id").map_err(SqliteStoreError::Storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(SqliteStoreError::Storage)?;
+    let mut survivors = BTreeMap::new();
+    let mut repairs = Vec::new();
+    for row in rows {
+        let (watch_id, kind, id) = row.map_err(SqliteStoreError::Storage)?;
+        match survivors.entry((watch_id, kind)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(id);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                repairs.push((entry.get().clone(), id))
+            }
+        }
+    }
+    drop(statement);
+    for (surviving, archived) in repairs {
+        tx.execute("INSERT INTO migration_repair(migration_version,surviving_rule_id,archived_rule_id,reason,repaired_at) VALUES (5,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))", params![surviving, archived, "duplicate active rule kind; kept earliest created_at then id"]).map_err(SqliteStoreError::Storage)?;
+        tx.execute("UPDATE rule SET state='archived',enabled=0,updated_at=(SELECT repaired_at FROM migration_repair WHERE archived_rule_id=?),archived_at=(SELECT repaired_at FROM migration_repair WHERE archived_rule_id=?) WHERE id=?", params![archived, archived, archived]).map_err(SqliteStoreError::Storage)?;
+    }
+    tx.execute_batch("CREATE UNIQUE INDEX one_live_rule_kind_per_watch ON rule(watch_id, kind) WHERE state != 'archived';").map_err(SqliteStoreError::Storage)
 }
 
 fn create_v1(tx: &Transaction<'_>) -> Result<()> {
@@ -895,13 +1033,14 @@ fn create_v1(tx: &Transaction<'_>) -> Result<()> {
         CREATE TABLE observation (
           id INTEGER PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES rule(id), rule_version INTEGER NOT NULL,
           revision TEXT NOT NULL, state TEXT NOT NULL, source_identity TEXT, source_url TEXT, detail TEXT, observed_at TEXT NOT NULL,
+          first_observed_at TEXT NOT NULL, first_source_seen_at TEXT,
           UNIQUE(rule_id, rule_version, revision), FOREIGN KEY(rule_id, rule_version) REFERENCES rule_definition(rule_id, version)
         );
         CREATE TABLE alert (
           id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES rule(id), rule_version INTEGER NOT NULL, watch_id TEXT NOT NULL REFERENCES watch(id), subject_key TEXT NOT NULL, rule_kind TEXT NOT NULL,
-          revision TEXT NOT NULL, source_identity TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+          revision TEXT NOT NULL, event_kind TEXT NOT NULL CHECK(event_kind IN ('missing','started','terminal')), source_identity TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('pending','acknowledged')), source_url TEXT, created_at TEXT NOT NULL, acknowledged_at TEXT,
-          UNIQUE(rule_id, rule_version, revision, source_identity), FOREIGN KEY(rule_id, rule_version) REFERENCES rule_definition(rule_id, version)
+          UNIQUE(rule_id, rule_version, revision, event_kind, source_identity), FOREIGN KEY(rule_id, rule_version) REFERENCES rule_definition(rule_id, version)
         );
         CREATE TABLE poll_attempt (
           id TEXT PRIMARY KEY, refresh_id TEXT NOT NULL, watch_id TEXT NOT NULL REFERENCES watch(id), subject_id INTEGER NOT NULL REFERENCES subject(id), revision TEXT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
@@ -914,7 +1053,9 @@ fn create_v1(tx: &Transaction<'_>) -> Result<()> {
         CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE lease (name TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
         CREATE TABLE import_record (source_fingerprint TEXT PRIMARY KEY, imported_at TEXT NOT NULL, source_path TEXT NOT NULL);
+        CREATE TABLE migration_repair (id INTEGER PRIMARY KEY, migration_version INTEGER NOT NULL, surviving_rule_id TEXT NOT NULL, archived_rule_id TEXT NOT NULL UNIQUE, reason TEXT NOT NULL, repaired_at TEXT NOT NULL);
         CREATE UNIQUE INDEX one_live_watch_per_subject ON watch(subject_id) WHERE state != 'archived';
+        CREATE UNIQUE INDEX one_live_rule_kind_per_watch ON rule(watch_id, kind) WHERE state != 'archived';
         CREATE INDEX observation_rule_latest ON observation(rule_id, rule_version, observed_at DESC);
         CREATE INDEX alert_created ON alert(created_at DESC);
         CREATE INDEX poll_subject_latest ON poll_attempt(subject_id, finished_at DESC);
@@ -1001,11 +1142,14 @@ impl CatalogRepository for SqliteStore {
         Ok(watch)
     }
     async fn add_rule(&self, draft: NewRule) -> std::result::Result<Rule, StoreError> {
+        draft.config.validate().map_err(store_error)?;
         let mut c = self
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
-        let tx = c.transaction().map_err(store_error)?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
         let state: Option<String> = tx
             .query_row(
                 "SELECT state FROM watch WHERE id=?",
@@ -1026,16 +1170,35 @@ impl CatalogRepository for SqliteStore {
             }
             _ => {}
         }
+        if let Some(existing_rule_id) =
+            existing_live_rule(&tx, &draft.watch_id, draft.config.kind())?
+        {
+            return Err(StoreError::RuleKindConflict {
+                watch_id: draft.watch_id,
+                kind: draft.config.kind(),
+                existing_rule_id,
+            });
+        }
         let id = RuleId::new(uid("rule")).map_err(store_error)?;
         let at = sql_timestamp(&draft.created_at);
         let json = serde_json::to_string(&draft.config).map_err(store_error)?;
-        tx.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)", params![id.as_str(),draft.watch_id.as_str(),rule_kind_text(draft.config.kind()),draft.enabled,at,at]).map_err(store_error)?;
+        if let Err(error) = tx.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)", params![id.as_str(),draft.watch_id.as_str(),rule_kind_text(draft.config.kind()),draft.enabled,at,at]) {
+            if let Some(existing_rule_id) = existing_live_rule(&tx, &draft.watch_id, draft.config.kind())? {
+                return Err(StoreError::RuleKindConflict {
+                    watch_id: draft.watch_id,
+                    kind: draft.config.kind(),
+                    existing_rule_id,
+                });
+            }
+            return Err(store_error(error));
+        }
         tx.execute("INSERT INTO rule_definition(rule_id,version,encoding_version,definition,created_at) VALUES (?,1,1,?,?)", params![id.as_str(),json,sql_timestamp(&draft.created_at)]).map_err(store_error)?;
         let rule = tx.query_row("SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=?", [id.as_str()], read_rule).map_err(store_error)?;
         tx.commit().map_err(store_error)?;
         Ok(rule)
     }
     async fn update_rule(&self, change: RuleChange) -> std::result::Result<Rule, StoreError> {
+        change.config.validate().map_err(store_error)?;
         let mut c = self
             .connection
             .lock()
@@ -1165,14 +1328,14 @@ impl RuntimeStore for SqliteStore {
     }
     async fn load_rule_history(
         &self,
-        keys: &[RuleKey],
+        candidates: &[(RuleKey, airborne_core::Revision)],
     ) -> std::result::Result<RuleHistorySet, StoreError> {
         let c = self
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
         let mut result = RuleHistorySet::default();
-        for key in keys {
+        for (key, candidate_revision) in candidates {
             let (watch_id, kind): (String, String) = c
                 .query_row(
                     "SELECT watch_id,kind FROM rule WHERE id=?",
@@ -1180,24 +1343,30 @@ impl RuntimeStore for SqliteStore {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(store_error)?;
-            let latest=c.query_row("SELECT rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at FROM observation WHERE rule_id=? AND rule_version=? ORDER BY observed_at DESC,id DESC LIMIT 1",params![key.rule_id.as_str(),key.rule_version.get()],|r| { let rid:String=r.get(0)?;let ver:u64=r.get(1)?;let rev:String=r.get(2)?;let state:String=r.get(3)?;let source:Option<String>=r.get(4)?;let url:Option<String>=r.get(5)?;let detail:Option<String>=r.get(6)?;let at:String=r.get(7)?; Ok(Observation { rule_id:RuleId::new(rid).map_err(domain_sql)?,rule_version:RuleVersion::new(ver).map_err(domain_sql)?,revision:airborne_core::Revision::new(rev).map_err(domain_sql)?,state:parse_state(state).map_err(store_sql)?,source_identity:source.map(SourceIdentity::new).transpose().map_err(domain_sql)?,source_url:url,detail,observed_at:text_timestamp(at).map_err(store_sql)? }) }).optional().map_err(store_error)?;
+            let latest=c.query_row("SELECT rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at,first_observed_at,first_source_seen_at FROM observation WHERE rule_id=? AND rule_version=? ORDER BY observed_at DESC,id DESC LIMIT 1",params![key.rule_id.as_str(),key.rule_version.get()],|r| { let rid:String=r.get(0)?;let ver:u64=r.get(1)?;let rev:String=r.get(2)?;let state:String=r.get(3)?;let source:Option<String>=r.get(4)?;let url:Option<String>=r.get(5)?;let detail:Option<String>=r.get(6)?;let at:String=r.get(7)?;let first:String=r.get(8)?;let first_source:Option<String>=r.get(9)?; Ok(Observation { rule_id:RuleId::new(rid).map_err(domain_sql)?,rule_version:RuleVersion::new(ver).map_err(domain_sql)?,revision:airborne_core::Revision::new(rev).map_err(domain_sql)?,state:parse_state(state).map_err(store_sql)?,source_identity:source.map(SourceIdentity::new).transpose().map_err(domain_sql)?,source_url:url,detail,observed_at:text_timestamp(at).map_err(store_sql)?,first_observed_at:text_timestamp(first).map_err(store_sql)?,first_source_seen_at:first_source.map(text_timestamp).transpose().map_err(store_sql)? }) }).optional().map_err(store_error)?;
+            let lifecycle = c.query_row("SELECT first_observed_at,first_source_seen_at FROM observation WHERE rule_id=? AND rule_version=? AND revision=?", params![key.rule_id.as_str(), key.rule_version.get(), candidate_revision.as_str()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).optional().map_err(store_error)?;
             let mut alerts = BTreeSet::new();
             let mut statement = c
                 .prepare(
-                    "SELECT revision,source_identity FROM alert WHERE rule_id=? AND rule_version=?",
+                    "SELECT revision,event_kind,source_identity FROM alert WHERE rule_id=? AND rule_version=?",
                 )
                 .map_err(store_error)?;
             for row in statement
                 .query_map(params![key.rule_id.as_str(), key.rule_version.get()], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(store_error)?
             {
-                let (revision, source) = row.map_err(store_error)?;
+                let (revision, event_kind, source) = row.map_err(store_error)?;
                 alerts.insert(AlertKey {
                     rule_id: key.rule_id.clone(),
                     rule_version: key.rule_version,
                     revision: airborne_core::Revision::new(revision).map_err(store_error)?,
+                    event_kind: parse_alert_event_kind(event_kind)?,
                     source_identity: SourceIdentity::new(source).map_err(store_error)?,
                 });
             }
@@ -1206,6 +1375,15 @@ impl RuntimeStore for SqliteStore {
                 RuleHistory {
                     watch_id: WatchId::new(watch_id).map_err(store_error)?,
                     rule_kind: parse_rule_kind(kind)?,
+                    first_observed_at: lifecycle
+                        .as_ref()
+                        .map(|(first, _)| text_timestamp(first.clone()))
+                        .transpose()?,
+                    first_source_seen_at: lifecycle
+                        .as_ref()
+                        .and_then(|(_, first)| first.clone())
+                        .map(text_timestamp)
+                        .transpose()?,
                     latest_observation: latest,
                     existing_alert_keys: alerts,
                 },
@@ -1235,12 +1413,12 @@ impl RuntimeStore for SqliteStore {
             tx.execute("UPDATE subject SET title=?,revision=?,metadata_refreshed_at=?,updated_at=? WHERE id=?",params![metadata.display_title,metadata.current_revision.as_str(),sql_timestamp(&metadata.metadata_refreshed_at),sql_timestamp(&metadata.metadata_refreshed_at),subject_id]).map_err(store_error)?;
         }
         for item in commit.observations {
-            tx.execute("INSERT INTO observation(rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,rule_version,revision) DO UPDATE SET state=excluded.state,source_identity=excluded.source_identity,source_url=excluded.source_url,detail=excluded.detail,observed_at=excluded.observed_at",params![item.rule_id.as_str(),item.rule_version.get(),item.revision.as_str(),state_text(item.state),item.source_identity.as_ref().map(|x|x.as_str()),item.source_url,item.detail,sql_timestamp(&item.observed_at)]).map_err(store_error)?;
+            tx.execute("INSERT INTO observation(rule_id,rule_version,revision,state,source_identity,source_url,detail,observed_at,first_observed_at,first_source_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,rule_version,revision) DO UPDATE SET state=excluded.state,source_identity=excluded.source_identity,source_url=excluded.source_url,detail=excluded.detail,observed_at=excluded.observed_at,first_observed_at=observation.first_observed_at,first_source_seen_at=COALESCE(observation.first_source_seen_at, excluded.first_source_seen_at)",params![item.rule_id.as_str(),item.rule_version.get(),item.revision.as_str(),state_text(item.state),item.source_identity.as_ref().map(|x|x.as_str()),item.source_url,item.detail,sql_timestamp(&item.observed_at),sql_timestamp(&item.first_observed_at),item.first_source_seen_at.as_ref().map(sql_timestamp)]).map_err(store_error)?;
         }
         let mut inserted = Vec::new();
         for item in commit.alerts {
             let id = AlertId::new(uid("alert")).map_err(store_error)?;
-            if tx.execute("INSERT OR IGNORE INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,source_identity,title,body,status,source_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?)",params![id.as_str(),item.key.rule_id.as_str(),item.key.rule_version.get(),item.watch_id.as_str(),item.subject_key.as_str(),rule_kind_text(item.rule_kind),item.key.revision.as_str(),item.key.source_identity.as_str(),item.title,item.body,item.source_url,sql_timestamp(&item.created_at)]).map_err(store_error)?==1 { inserted.push(Alert {id,key:item.key,watch_id:item.watch_id,subject_key:item.subject_key,rule_kind:item.rule_kind,title:item.title,body:item.body,source_url:item.source_url,created_at:item.created_at,acknowledged_at:None}); }
+            if tx.execute("INSERT OR IGNORE INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,source_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)",params![id.as_str(),item.key.rule_id.as_str(),item.key.rule_version.get(),item.watch_id.as_str(),item.subject_key.as_str(),rule_kind_text(item.rule_kind),item.key.revision.as_str(),alert_event_kind_text(item.key.event_kind),item.key.source_identity.as_str(),item.title,item.body,item.source_url,sql_timestamp(&item.created_at)]).map_err(store_error)?==1 { inserted.push(Alert {id,key:item.key,watch_id:item.watch_id,subject_key:item.subject_key,rule_kind:item.rule_kind,title:item.title,body:item.body,source_url:item.source_url,created_at:item.created_at,acknowledged_at:None}); }
         }
         for issue in commit.issues {
             tx.execute("INSERT INTO source_issue(poll_attempt_id,rule_id,scope,provider,kind,retryable,message,created_at) VALUES (?,?,?,?,?,?,?,?)",params![attempt_id,issue.rule_id.as_ref().map(airborne_core::RuleId::as_str),format!("{:?}",issue.scope).to_lowercase(),format!("{:?}",issue.provider).to_lowercase(),issue.kind,issue.retryable,issue.safe_message,sql_timestamp(&commit.attempt.finished_at)]).map_err(store_error)?;
@@ -1353,7 +1531,7 @@ impl AlertRepository for SqliteStore {
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
-        let mut st=c.prepare("SELECT a.id,a.rule_id,a.rule_version,a.revision,a.source_identity,r.watch_id,s.subject_key,r.kind,a.title,a.body,a.source_url,a.created_at,a.acknowledged_at FROM alert a JOIN rule r ON r.id=a.rule_id JOIN watch w ON w.id=r.watch_id JOIN subject s ON s.id=w.subject_id WHERE (?1=0 OR a.status='pending') AND (?2 IS NULL OR r.watch_id=?2) ORDER BY a.created_at DESC,a.id DESC").map_err(store_error)?;
+        let mut st=c.prepare("SELECT a.id,a.rule_id,a.rule_version,a.revision,a.event_kind,a.source_identity,r.watch_id,s.subject_key,r.kind,a.title,a.body,a.source_url,a.created_at,a.acknowledged_at FROM alert a JOIN rule r ON r.id=a.rule_id JOIN watch w ON w.id=r.watch_id JOIN subject s ON s.id=w.subject_id WHERE (?1=0 OR a.status='pending') AND (?2 IS NULL OR r.watch_id=?2) ORDER BY a.created_at DESC,a.id DESC").map_err(store_error)?;
         let alerts = st
             .query_map(
                 params![pending_only, watch.as_ref().map(|x| x.as_str())],
@@ -1362,21 +1540,23 @@ impl AlertRepository for SqliteStore {
                     let rule: String = r.get(1)?;
                     let version: u64 = r.get(2)?;
                     let revision: String = r.get(3)?;
-                    let source: String = r.get(4)?;
-                    let watch: String = r.get(5)?;
-                    let subject: String = r.get(6)?;
-                    let kind: String = r.get(7)?;
-                    let title: String = r.get(8)?;
-                    let body: String = r.get(9)?;
-                    let source_url: Option<String> = r.get(10)?;
-                    let created: String = r.get(11)?;
-                    let acknowledged: Option<String> = r.get(12)?;
+                    let event_kind: String = r.get(4)?;
+                    let source: String = r.get(5)?;
+                    let watch: String = r.get(6)?;
+                    let subject: String = r.get(7)?;
+                    let kind: String = r.get(8)?;
+                    let title: String = r.get(9)?;
+                    let body: String = r.get(10)?;
+                    let source_url: Option<String> = r.get(11)?;
+                    let created: String = r.get(12)?;
+                    let acknowledged: Option<String> = r.get(13)?;
                     Ok(Alert {
                         id: AlertId::new(id).map_err(domain_sql)?,
                         key: AlertKey {
                             rule_id: RuleId::new(rule).map_err(domain_sql)?,
                             rule_version: RuleVersion::new(version).map_err(domain_sql)?,
                             revision: airborne_core::Revision::new(revision).map_err(domain_sql)?,
+                            event_kind: parse_alert_event_kind(event_kind).map_err(store_sql)?,
                             source_identity: SourceIdentity::new(source).map_err(domain_sql)?,
                         },
                         watch_id: WatchId::new(watch).map_err(domain_sql)?,
@@ -1422,7 +1602,7 @@ mod tests {
     fn makes_all_logical_tables_and_reopens() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
         store.integrity_check().unwrap();
         drop(store);
         assert_eq!(
@@ -1430,7 +1610,7 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            4
+            5
         );
     }
     #[test]
@@ -1441,6 +1621,116 @@ mod tests {
         c.execute("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('x','github_pull_request','https://github.com/a/b/pull/1','t','x','x')", []).unwrap();
         c.execute("INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('a',1,'active','x','x')", []).unwrap();
         assert!(c.execute("INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('b',1,'paused','x','x')", []).is_err());
+    }
+    #[test]
+    fn one_live_rule_kind_keeps_disabled_rows_and_archive_frees_the_kind() {
+        let store = SqliteStore::memory().unwrap();
+        let c = store.connection.lock().unwrap();
+        c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','x','x'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','x','x'); INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('first','w','github_check_completes',0,1,'active','x','x');").unwrap();
+        assert!(c.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('second','w','github_check_completes',1,1,'active','y','y')", []).is_err());
+        c.execute(
+            "UPDATE rule SET state='archived',archived_at='z' WHERE id='first'",
+            [],
+        )
+        .unwrap();
+        c.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('second','w','github_check_completes',1,1,'active','y','y')", []).unwrap();
+    }
+    #[test]
+    fn alert_event_kind_is_part_of_the_unique_key() {
+        let store = SqliteStore::memory().unwrap();
+        let c = store.connection.lock().unwrap();
+        c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','x','x'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','x','x'); INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('r','w','github_check_completes',1,1,'active','x','x'); INSERT INTO rule_definition VALUES ('r',1,1,'{\"kind\":\"git_hub_check_completes\",\"check_name\":\"x\"}','x'); INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,created_at) VALUES ('started','r',1,'w','s','github_check_completes','v','started','source','t','b','pending','x'); INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,created_at) VALUES ('terminal','r',1,'w','s','github_check_completes','v','terminal','source','t','b','pending','x');").unwrap();
+        assert!(c.execute("INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,created_at) VALUES ('duplicate','r',1,'w','s','github_check_completes','v','terminal','source','t','b','pending','x')", []).is_err());
+    }
+    #[test]
+    fn concurrent_file_database_rule_adds_return_a_typed_conflict() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::open(file.path()).unwrap();
+        {
+            let c = store.connection.lock().unwrap();
+            c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").unwrap();
+        }
+        drop(store);
+        let path = file.path().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let run = |path: PathBuf, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let store = SqliteStore::open(path).unwrap();
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(store.add_rule(NewRule {
+                        watch_id: WatchId::new("w").unwrap(),
+                        config: RuleConfig::GitHubCheckCompletes {
+                            check_name: "ci".into(),
+                            alert_on_start: false,
+                            alert_if_missing_after_seconds: None,
+                        },
+                        enabled: true,
+                        created_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                    }))
+            })
+        };
+        let first = run(path.clone(), Arc::clone(&barrier));
+        let second = run(path, Arc::clone(&barrier));
+        barrier.wait();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let successful_rule_id = first
+            .as_ref()
+            .ok()
+            .or_else(|| second.as_ref().ok())
+            .unwrap()
+            .id
+            .clone();
+        let error = first.err().or(second.err()).unwrap();
+        assert!(matches!(
+            error,
+            StoreError::RuleKindConflict {
+                watch_id,
+                kind: RuleKind::GitHubCheckCompletes,
+                existing_rule_id,
+            } if watch_id == WatchId::new("w").unwrap() && existing_rule_id == successful_rule_id
+        ));
+    }
+    #[tokio::test]
+    async fn add_and_update_reject_zero_missing_delay_before_writing() {
+        let store = SqliteStore::memory().unwrap();
+        {
+            let c = store.connection.lock().unwrap();
+            c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").unwrap();
+        }
+        let invalid = || RuleConfig::GitHubCheckCompletes {
+            check_name: "ci".into(),
+            alert_on_start: false,
+            alert_if_missing_after_seconds: Some(0),
+        };
+        assert!(store
+            .add_rule(NewRule {
+                watch_id: WatchId::new("w").unwrap(),
+                config: invalid(),
+                enabled: true,
+                created_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap()
+            })
+            .await
+            .is_err());
+        assert!(store
+            .update_rule(RuleChange {
+                id: RuleId::new("missing").unwrap(),
+                config: invalid(),
+                at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap()
+            })
+            .await
+            .is_err());
+        let c = store.connection.lock().unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM rule", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
     #[test]
     fn imports_prototype_without_mutating_it_and_is_idempotent() {
@@ -1483,6 +1773,79 @@ mod tests {
             c.query_row("SELECT status FROM alert", [], |r| r.get::<_, String>(0))
                 .unwrap(),
             "acknowledged"
+        );
+    }
+    #[test]
+    fn prototype_import_skips_an_invalid_alert_policy() {
+        let legacy = tempfile::NamedTempFile::new().unwrap();
+        let source = Connection::open(legacy.path()).unwrap();
+        source.execute_batch("CREATE TABLE watch (id INTEGER PRIMARY KEY,github_owner TEXT,github_repo TEXT,github_pr_number INTEGER,title TEXT,active INTEGER,created_at TEXT,head_sha TEXT); CREATE TABLE rule (id INTEGER PRIMARY KEY,watch_id INTEGER,kind TEXT,config_json TEXT,enabled INTEGER,created_at TEXT); CREATE TABLE rule_observation (rule_id INTEGER,head_sha TEXT,state TEXT,source_identity TEXT,source_url TEXT,detail TEXT,observed_at TEXT); CREATE TABLE alert (rule_id INTEGER,head_sha TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT,created_at TEXT); CREATE TABLE setting (key TEXT PRIMARY KEY,value TEXT); INSERT INTO watch VALUES(1,'owner','repo',7,'A title',1,'2026-09-08T00:00:00Z','abc'); INSERT INTO rule VALUES(2,1,'cursor_bugbot_completed','{\"check_name\":\"Cursor Bugbot\",\"alert_if_missing_after_seconds\":0}',1,'2026-09-08T00:00:00Z');").unwrap();
+        drop(source);
+        let report = SqliteStore::memory()
+            .unwrap()
+            .import_prototype(legacy.path(), false)
+            .unwrap();
+        assert_eq!(report.rules, 0);
+        assert_eq!(report.skipped, 1);
+    }
+    #[test]
+    fn prototype_import_archives_later_duplicate_rules_and_keeps_history() {
+        let legacy = tempfile::NamedTempFile::new().unwrap();
+        let source = Connection::open(legacy.path()).unwrap();
+        source.execute_batch("CREATE TABLE watch (id INTEGER PRIMARY KEY,github_owner TEXT,github_repo TEXT,github_pr_number INTEGER,title TEXT,active INTEGER,created_at TEXT,head_sha TEXT); CREATE TABLE rule (id INTEGER PRIMARY KEY,watch_id INTEGER,kind TEXT,config_json TEXT,enabled INTEGER,created_at TEXT); CREATE TABLE rule_observation (rule_id INTEGER,head_sha TEXT,state TEXT,source_identity TEXT,source_url TEXT,detail TEXT,observed_at TEXT); CREATE TABLE alert (rule_id INTEGER,head_sha TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT,created_at TEXT); CREATE TABLE setting (key TEXT PRIMARY KEY,value TEXT); INSERT INTO watch VALUES(1,'owner','repo',7,'A title',1,'2026-09-08T00:00:00Z','abc'); INSERT INTO rule VALUES(2,1,'cursor_bugbot_completed','{\"check_name\":\"first\"}',1,'2026-09-08T00:00:00Z'),(3,1,'cursor_bugbot_completed','{\"check_name\":\"later\"}',1,'2026-09-08T00:01:00Z'); INSERT INTO rule_observation VALUES(2,'abc','completed','first','https://example.test/first','done','2026-09-08T00:02:00Z'),(3,'abc','completed','later','https://example.test/later','done','2026-09-08T00:03:00Z'); INSERT INTO alert VALUES(2,'abc','first','first alert','body','unread','2026-09-08T00:02:00Z'),(3,'abc','later','later alert','body','read','2026-09-08T00:03:00Z');").unwrap();
+        drop(source);
+        let store = SqliteStore::memory().unwrap();
+        let report = store.import_prototype(legacy.path(), false).unwrap();
+        assert_eq!(
+            (
+                report.rules,
+                report.observations,
+                report.alerts,
+                report.repaired
+            ),
+            (2, 2, 2, 1)
+        );
+        assert!(
+            store
+                .import_prototype(legacy.path(), false)
+                .unwrap()
+                .already_imported
+        );
+        let c = store.connection.lock().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM rule WHERE state='active'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM rule WHERE state='archived'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM observation", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM alert", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM migration_repair", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
     #[tokio::test]
@@ -1567,47 +1930,78 @@ mod tests {
             0
         );
     }
-    #[test]
-    fn v3_database_upgrades_to_v4_without_losing_alert_rows() {
+    fn legacy_database_with_alert(version: i64) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
         let c = Connection::open(file.path()).unwrap();
-        c.execute_batch("CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT); INSERT INTO schema_migration VALUES(3,'x'); CREATE TABLE alert(id TEXT PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT,source_url TEXT,created_at TEXT,acknowledged_at TEXT); INSERT INTO alert VALUES('a','r',1,'v','s','t','b','pending',NULL,'x',NULL);").unwrap();
-        drop(c);
-        let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
-        let c = store.connection.lock().unwrap();
-        assert_eq!(
-            c.query_row("SELECT count(*) FROM alert", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+        let source_url = if version == 1 { "" } else { ",source_url TEXT" };
+        c.execute_batch(&format!("CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT); INSERT INTO schema_migration VALUES({version},'x'); CREATE TABLE subject(id INTEGER PRIMARY KEY,subject_key TEXT,kind TEXT,canonical_url TEXT,title TEXT,revision TEXT,metadata_refreshed_at TEXT,created_at TEXT,updated_at TEXT); CREATE TABLE watch(id TEXT PRIMARY KEY,subject_id INTEGER,state TEXT,created_at TEXT,updated_at TEXT,archived_at TEXT); CREATE TABLE rule(id TEXT PRIMARY KEY,watch_id TEXT,kind TEXT,enabled INTEGER,current_version INTEGER,state TEXT,created_at TEXT,updated_at TEXT,archived_at TEXT); CREATE TABLE rule_definition(rule_id TEXT,version INTEGER,encoding_version INTEGER,definition TEXT,created_at TEXT,PRIMARY KEY(rule_id,version)); CREATE TABLE observation(id INTEGER PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,state TEXT,source_identity TEXT,source_url TEXT,detail TEXT,observed_at TEXT); CREATE TABLE alert(id TEXT PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT{source_url},created_at TEXT,acknowledged_at TEXT); CREATE TABLE poll_attempt(id TEXT); CREATE TABLE source_issue(id INTEGER); INSERT INTO subject VALUES(1,'s','github_pull_request','u','t',NULL,NULL,'x','x'); INSERT INTO watch VALUES('w',1,'active','x','x',NULL); INSERT INTO rule VALUES('r','w','github_check_completes',1,1,'active','x','x',NULL); INSERT INTO rule_definition VALUES('r',1,1,'{{}}','x'); INSERT INTO alert(id,rule_id,rule_version,revision,source_identity,title,body,status,created_at,acknowledged_at) VALUES('a','r',1,'v','source','t','b','pending','x',NULL);" )).unwrap();
+        file
     }
     #[test]
-    fn v1_and_v2_databases_upgrade_forward_without_losing_alerts() {
-        for version in [1, 2] {
-            let file = tempfile::NamedTempFile::new().unwrap();
-            let c = Connection::open(file.path()).unwrap();
-            let source_url = if version == 1 { "" } else { ",source_url TEXT" };
-            c.execute_batch(&format!("CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT); INSERT INTO schema_migration VALUES({version},'x'); CREATE TABLE alert(id TEXT PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT{source_url},created_at TEXT,acknowledged_at TEXT); INSERT INTO alert(id,rule_id,rule_version,revision,source_identity,title,body,status,created_at,acknowledged_at) VALUES('a','r',1,'v','s','t','b','pending','x',NULL); CREATE TABLE poll_attempt(id TEXT); CREATE TABLE source_issue(id INTEGER);")).unwrap();
-            drop(c);
+    fn every_supported_legacy_schema_backfills_alert_display_fields() {
+        for version in [1, 2, 3] {
+            let file = legacy_database_with_alert(version);
             let store = SqliteStore::open(file.path()).unwrap();
-            if version == 1 {
-                drop(store);
-                let store = SqliteStore::open(file.path()).unwrap();
-                assert_eq!(store.schema_version().unwrap(), 4);
-            } else {
-                assert_eq!(store.schema_version().unwrap(), 4);
-                drop(store);
-                let store = SqliteStore::open(file.path()).unwrap();
-                assert_eq!(store.schema_version().unwrap(), 4);
-            }
-            let c = Connection::open(file.path()).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 5);
+            let c = store.connection.lock().unwrap();
             assert_eq!(
-                c.query_row("SELECT count(*) FROM alert", [], |r| r.get::<_, i64>(0))
+                c.query_row("SELECT watch_id FROM alert", [], |r| r.get::<_, String>(0))
                     .unwrap(),
-                1
+                "w"
+            );
+            assert_eq!(
+                c.query_row("SELECT subject_key FROM alert", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "s"
+            );
+            assert_eq!(
+                c.query_row("SELECT rule_kind FROM alert", [], |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "github_check_completes"
+            );
+            assert_eq!(
+                c.query_row("SELECT event_kind FROM alert", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "terminal"
             );
         }
+    }
+    #[test]
+    fn v4_migration_preserves_lifecycle_data_and_repairs_duplicate_rules() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let c = Connection::open(file.path()).unwrap();
+        c.execute_batch("CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT); INSERT INTO schema_migration VALUES(4,'x'); CREATE TABLE subject(id INTEGER PRIMARY KEY,subject_key TEXT); CREATE TABLE watch(id TEXT PRIMARY KEY,subject_id INTEGER); CREATE TABLE rule(id TEXT PRIMARY KEY,watch_id TEXT,kind TEXT,enabled INTEGER,current_version INTEGER,state TEXT,created_at TEXT,updated_at TEXT,archived_at TEXT); CREATE TABLE rule_definition(rule_id TEXT,version INTEGER,encoding_version INTEGER,definition TEXT,created_at TEXT,PRIMARY KEY(rule_id,version)); CREATE TABLE observation(id INTEGER PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,state TEXT,source_identity TEXT,source_url TEXT,detail TEXT,observed_at TEXT); CREATE TABLE alert(id TEXT PRIMARY KEY,rule_id TEXT,rule_version INTEGER,watch_id TEXT,subject_key TEXT,rule_kind TEXT,revision TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT,source_url TEXT,created_at TEXT,acknowledged_at TEXT); INSERT INTO subject VALUES(1,'s'); INSERT INTO watch VALUES('w',1); INSERT INTO rule VALUES('first','w','github_check_completes',1,1,'active','2026-01-01T00:00:00Z','x',NULL),('later','w','github_check_completes',1,1,'active','2026-01-02T00:00:00Z','x',NULL); INSERT INTO rule_definition VALUES('first',1,1,'{}','x'),('later',1,1,'{}','x'); INSERT INTO observation VALUES(1,'first',1,'v','completed','source',NULL,NULL,'2026-01-03T00:00:00Z'); INSERT INTO alert VALUES('a','first',1,'w','s','github_check_completes','v','source','t','b','pending',NULL,'x',NULL);").unwrap();
+        drop(c);
+        let store = SqliteStore::open(file.path()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 5);
+        let c = store.connection.lock().unwrap();
+        assert_eq!(
+            c.query_row("SELECT event_kind FROM alert", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "terminal"
+        );
+        assert_eq!(
+            c.query_row("SELECT first_observed_at FROM observation", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "2026-01-03T00:00:00Z"
+        );
+        assert_eq!(
+            c.query_row("SELECT state FROM rule WHERE id='later'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "archived"
+        );
+        assert_eq!(
+            c.query_row("SELECT surviving_rule_id FROM migration_repair", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "first"
+        );
     }
     #[test]
     fn alert_deduplication_survives_a_database_restart() {
@@ -1615,11 +2009,11 @@ mod tests {
         let store = SqliteStore::open(file.path()).unwrap();
         {
             let c = store.connection.lock().unwrap();
-            c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','x','x'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','x','x'); INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('r','w','github_check_completes',1,1,'active','x','x'); INSERT INTO rule_definition VALUES ('r',1,1,'{\"kind\":\"git_hub_check_completes\",\"check_name\":\"x\"}','x'); INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,source_identity,title,body,status,created_at) VALUES ('a','r',1,'w','s','github_check_completes','v','source','t','b','pending','x');").unwrap();
+            c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','x','x'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','x','x'); INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('r','w','github_check_completes',1,1,'active','x','x'); INSERT INTO rule_definition VALUES ('r',1,1,'{\"kind\":\"git_hub_check_completes\",\"check_name\":\"x\"}','x'); INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,created_at) VALUES ('a','r',1,'w','s','github_check_completes','v','terminal','source','t','b','pending','x');").unwrap();
         }
         drop(store);
         let store = SqliteStore::open(file.path()).unwrap();
         let c = store.connection.lock().unwrap();
-        assert!(c.execute("INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,source_identity,title,body,status,created_at) VALUES ('b','r',1,'w','s','github_check_completes','v','source','t','b','pending','x')",[]).is_err());
+        assert!(c.execute("INSERT INTO alert(id,rule_id,rule_version,watch_id,subject_key,rule_kind,revision,event_kind,source_identity,title,body,status,created_at) VALUES ('b','r',1,'w','s','github_check_completes','v','terminal','source','t','b','pending','x')",[]).is_err());
     }
 }

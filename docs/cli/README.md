@@ -12,8 +12,10 @@ they conflict with this directory, this directory wins.
 
 ## Product decision
 
-Airborne is a local command-line tool that watches pull requests and records an
-alert when a selected check or Buildkite job finishes. It has no required
+Airborne is a local command-line tool that watches pull requests and records
+alerts when selected checks or Buildkite jobs finish. A Bugbot rule may also
+alert when its check starts or stays undetected past a configured delay. It has
+no required
 desktop app, web view, tray icon, or hosted service.
 
 The CLI is the product host, not a test shell around a future desktop app. A
@@ -39,5 +41,5 @@ Each requirement uses one of these words:
 
 Code, tests, command help, and storage migrations must use the names in the
 domain model. A change to product behavior must update these documents in the
-same change as the code.
-
+same change as the code. This specification deliberately leaves a broader CLI
+UX redesign for later work.

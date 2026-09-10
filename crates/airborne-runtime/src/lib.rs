@@ -14,8 +14,8 @@ use std::{
 
 use airborne_core::{
     reconcile, Alert, AlertDraft, Candidate, Observation, PollAttemptDraft, PollOutcome, RefreshId,
-    RuleHistorySet, RuleKey, SourceIssueDraft, Subject, SubjectKey, SubjectMetadataUpdate,
-    Timestamp, VersionedRule, Watch, WatchId,
+    Revision, RuleHistorySet, RuleId, RuleKey, RuleKind, SourceIssueDraft, Subject, SubjectKey,
+    SubjectMetadataUpdate, Timestamp, VersionedRule, Watch, WatchId,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -87,6 +87,14 @@ pub struct AppliedPoll {
 pub enum StoreError {
     #[error("{message}")]
     Failed { message: String },
+    #[error(
+        "watch {watch_id} already has an active {kind:?} rule ({existing_rule_id}); archive it before adding another"
+    )]
+    RuleKindConflict {
+        watch_id: WatchId,
+        kind: RuleKind,
+        existing_rule_id: RuleId,
+    },
 }
 
 #[async_trait]
@@ -96,7 +104,10 @@ pub trait RuntimeStore: Send + Sync {
         scope: RefreshScope,
     ) -> Result<Vec<RefreshTarget>, StoreError>;
 
-    async fn load_rule_history(&self, keys: &[RuleKey]) -> Result<RuleHistorySet, StoreError>;
+    async fn load_rule_history(
+        &self,
+        candidates: &[(RuleKey, Revision)],
+    ) -> Result<RuleHistorySet, StoreError>;
 
     /// Applies all durable effects of one subject poll in one transaction.
     async fn apply_poll(&self, commit: PollCommit) -> Result<AppliedPoll, StoreError>;
@@ -453,15 +464,17 @@ impl Runtime {
         {
             return Err(RuntimeError::IncompleteMonitorReport);
         }
-        let candidate_keys: Vec<_> = report
+        let candidate_revisions: Vec<_> = report
             .results
             .iter()
             .filter_map(|result| match result {
-                RulePollResult::Candidate(candidate) => Some(candidate.rule_key.clone()),
+                RulePollResult::Candidate(candidate) => {
+                    Some((candidate.rule_key.clone(), candidate.revision.clone()))
+                }
                 RulePollResult::Issue { .. } => None,
             })
             .collect();
-        let histories = self.store.load_rule_history(&candidate_keys).await?;
+        let histories = self.store.load_rule_history(&candidate_revisions).await?;
 
         let mut observations = Vec::new();
         let mut alerts = Vec::new();
@@ -624,12 +637,15 @@ fn refresh_outcome(reports: &[SubjectRefreshReport]) -> PollOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::{BTreeMap, BTreeSet, VecDeque},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use airborne_core::{
-        CandidateState, Rule, RuleConfig, RuleDefinition, RuleHistory, RuleKind, RuleVersion,
-        WatchState,
+        AlertEventKind, AlertId, AlertIntent, CandidateState, Rule, RuleConfig, RuleDefinition,
+        RuleHistory, RuleKind, RuleVersion, SourceIdentity, WatchState,
     };
     use tokio::sync::Mutex;
 
@@ -666,6 +682,8 @@ mod tests {
             version,
             config: RuleConfig::GitHubCheckCompletes {
                 check_name: "Cursor Bugbot".into(),
+                alert_on_start: false,
+                alert_if_missing_after_seconds: None,
             },
             created_at: at.clone(),
         };
@@ -728,9 +746,12 @@ mod tests {
         ) -> Result<Vec<RefreshTarget>, StoreError> {
             Ok(self.targets.clone())
         }
-        async fn load_rule_history(&self, keys: &[RuleKey]) -> Result<RuleHistorySet, StoreError> {
+        async fn load_rule_history(
+            &self,
+            candidates: &[(RuleKey, Revision)],
+        ) -> Result<RuleHistorySet, StoreError> {
             let mut histories = RuleHistorySet::default();
-            for key in keys {
+            for (key, _) in candidates {
                 let target = self
                     .targets
                     .iter()
@@ -742,6 +763,8 @@ mod tests {
                         watch_id: target.watch.id.clone(),
                         rule_kind: RuleKind::GitHubCheckCompletes,
                         latest_observation: None,
+                        first_observed_at: None,
+                        first_source_seen_at: None,
                         existing_alert_keys: std::collections::BTreeSet::default(),
                     },
                 );
@@ -920,6 +943,316 @@ mod tests {
         assert_eq!(report.subjects[0].outcome, PollOutcome::Success);
         assert_eq!(report.subjects[1].outcome, PollOutcome::Failure);
         assert_eq!(store.commits.lock().await.len(), 2);
+    }
+
+    struct LifecycleStore {
+        targets: Vec<RefreshTarget>,
+        history: Mutex<LifecycleHistory>,
+        commits: Mutex<Vec<PollCommit>>,
+        next_alert: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct LifecycleHistory {
+        latest: BTreeMap<RuleKey, Observation>,
+        revisions: BTreeMap<(RuleKey, Revision), (Timestamp, Option<Timestamp>)>,
+        alert_keys: BTreeMap<RuleKey, BTreeSet<airborne_core::AlertKey>>,
+    }
+
+    impl LifecycleStore {
+        fn history_for(
+            &self,
+            key: &RuleKey,
+            revision: &Revision,
+            stored: &LifecycleHistory,
+        ) -> RuleHistory {
+            let target = self
+                .targets
+                .iter()
+                .find(|target| target.rules.iter().any(|rule| rule.key() == *key))
+                .expect("test rule belongs to target");
+            RuleHistory {
+                watch_id: target.watch.id.clone(),
+                rule_kind: target.rules[0].rule.kind,
+                latest_observation: stored.latest.get(key).cloned(),
+                first_observed_at: stored
+                    .revisions
+                    .get(&(key.clone(), revision.clone()))
+                    .map(|(first_observed_at, _)| first_observed_at.clone()),
+                first_source_seen_at: stored
+                    .revisions
+                    .get(&(key.clone(), revision.clone()))
+                    .and_then(|(_, first_source_seen_at)| first_source_seen_at.clone()),
+                existing_alert_keys: stored.alert_keys.get(key).cloned().unwrap_or_default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeStore for LifecycleStore {
+        async fn load_refresh_targets(
+            &self,
+            _: RefreshScope,
+        ) -> Result<Vec<RefreshTarget>, StoreError> {
+            Ok(self.targets.clone())
+        }
+
+        async fn load_rule_history(
+            &self,
+            candidates: &[(RuleKey, Revision)],
+        ) -> Result<RuleHistorySet, StoreError> {
+            let stored = self.history.lock().await;
+            let mut loaded = RuleHistorySet::default();
+            for (key, revision) in candidates {
+                loaded.insert(key.clone(), self.history_for(key, revision, &stored));
+            }
+            Ok(loaded)
+        }
+
+        async fn apply_poll(&self, commit: PollCommit) -> Result<AppliedPoll, StoreError> {
+            // Keep the observation and its alert keys under one lock to mirror the
+            // store transaction required by the runtime boundary.
+            let mut stored = self.history.lock().await;
+            let mut new_alerts = Vec::new();
+            for observation in &commit.observations {
+                let key = RuleKey {
+                    rule_id: observation.rule_id.clone(),
+                    rule_version: observation.rule_version,
+                };
+                stored.latest.insert(key.clone(), observation.clone());
+                stored.revisions.insert(
+                    (key, observation.revision.clone()),
+                    (
+                        observation.first_observed_at.clone(),
+                        observation.first_source_seen_at.clone(),
+                    ),
+                );
+            }
+            for draft in &commit.alerts {
+                let key = RuleKey {
+                    rule_id: draft.key.rule_id.clone(),
+                    rule_version: draft.key.rule_version,
+                };
+                if stored
+                    .alert_keys
+                    .entry(key)
+                    .or_default()
+                    .insert(draft.key.clone())
+                {
+                    let id = self.next_alert.fetch_add(1, Ordering::SeqCst);
+                    new_alerts.push(Alert {
+                        id: AlertId::new(format!("alert-{id}")).unwrap(),
+                        key: draft.key.clone(),
+                        watch_id: draft.watch_id.clone(),
+                        subject_key: draft.subject_key.clone(),
+                        rule_kind: draft.rule_kind,
+                        title: draft.title.clone(),
+                        body: draft.body.clone(),
+                        source_url: draft.source_url.clone(),
+                        created_at: draft.created_at.clone(),
+                        acknowledged_at: None,
+                    });
+                }
+            }
+            drop(stored);
+            self.commits.lock().await.push(commit);
+            Ok(AppliedPoll { new_alerts })
+        }
+    }
+
+    struct SequenceMonitor(Mutex<VecDeque<Candidate>>);
+
+    #[async_trait]
+    impl SubjectMonitor for SequenceMonitor {
+        fn kind(&self) -> airborne_core::SubjectKind {
+            airborne_core::SubjectKind::GitHubPullRequest
+        }
+
+        async fn poll(&self, request: MonitorRequest) -> MonitorReport {
+            let candidate = self.0.lock().await.pop_front().expect("queued candidate");
+            MonitorReport {
+                subject_key: request.subject.key,
+                metadata: None,
+                revision: Some(candidate.revision.clone()),
+                results: vec![RulePollResult::Candidate(candidate)],
+                subject_issue: None,
+            }
+        }
+    }
+
+    fn lifecycle_candidate(
+        target: &RefreshTarget,
+        revision: &str,
+        at: &str,
+        state: CandidateState,
+        source: Option<&str>,
+        alert_intent: Option<AlertIntent>,
+    ) -> Candidate {
+        Candidate {
+            rule_key: target.rules[0].key(),
+            subject_key: target.subject.key.clone(),
+            revision: airborne_core::Revision::new(revision).unwrap(),
+            state,
+            source_identity: source.map(|source| SourceIdentity::new(source).unwrap()),
+            source_url: None,
+            detail: None,
+            alert_intent,
+            observed_at: Timestamp::parse(at).unwrap(),
+        }
+    }
+
+    fn alert_intent(kind: AlertEventKind, source: Option<&str>) -> AlertIntent {
+        match kind {
+            AlertEventKind::Missing => AlertIntent::Missing {
+                after_seconds: 60,
+                title: "missing".into(),
+                body: "missing".into(),
+            },
+            AlertEventKind::Started => AlertIntent::Started {
+                source_identity: SourceIdentity::new(source.unwrap()).unwrap(),
+                title: "started".into(),
+                body: "started".into(),
+            },
+            AlertEventKind::Terminal => AlertIntent::Terminal {
+                source_identity: SourceIdentity::new(source.unwrap()).unwrap(),
+                title: "terminal".into(),
+                body: "terminal".into(),
+            },
+        }
+    }
+
+    fn lifecycle_candidates(target: &RefreshTarget) -> Vec<Candidate> {
+        vec![
+            // The first observation only establishes the baseline.
+            lifecycle_candidate(
+                target,
+                "rev-1",
+                "2026-09-08T12:00:00Z",
+                CandidateState::NotDetected,
+                None,
+                Some(alert_intent(AlertEventKind::Missing, None)),
+            ),
+            // A missing source alerts only after its configured delay.
+            lifecycle_candidate(
+                target,
+                "rev-1",
+                "2026-09-08T12:01:00Z",
+                CandidateState::NotDetected,
+                None,
+                Some(alert_intent(AlertEventKind::Missing, None)),
+            ),
+            // Seeing a source suppresses later missing alerts for this revision.
+            lifecycle_candidate(
+                target,
+                "rev-1",
+                "2026-09-08T12:02:00Z",
+                CandidateState::Waiting,
+                Some("run-1"),
+                Some(alert_intent(AlertEventKind::Started, Some("run-1"))),
+            ),
+            lifecycle_candidate(
+                target,
+                "rev-1",
+                "2026-09-08T12:03:00Z",
+                CandidateState::NotDetected,
+                None,
+                Some(alert_intent(AlertEventKind::Missing, None)),
+            ),
+            lifecycle_candidate(
+                target,
+                "rev-1",
+                "2026-09-08T12:04:00Z",
+                CandidateState::Completed,
+                Some("run-1"),
+                Some(alert_intent(AlertEventKind::Terminal, Some("run-1"))),
+            ),
+            // A source first seen terminal emits only its terminal event.
+            lifecycle_candidate(
+                target,
+                "rev-2",
+                "2026-09-08T12:05:00Z",
+                CandidateState::Completed,
+                Some("run-2"),
+                Some(alert_intent(AlertEventKind::Terminal, Some("run-2"))),
+            ),
+            // Returning to an earlier revision keeps that revision's timer.
+            lifecycle_candidate(
+                target,
+                "rev-1",
+                "2026-09-08T12:06:00Z",
+                CandidateState::NotDetected,
+                None,
+                Some(alert_intent(AlertEventKind::Missing, None)),
+            ),
+            // The persisted terminal key suppresses a duplicate after restart.
+            lifecycle_candidate(
+                target,
+                "rev-2",
+                "2026-09-08T12:07:00Z",
+                CandidateState::Completed,
+                Some("run-2"),
+                Some(alert_intent(AlertEventKind::Terminal, Some("run-2"))),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn runtime_persists_lifecycle_history_and_alert_keys_across_restarts() {
+        let target = target("lifecycle");
+        let candidates = lifecycle_candidates(&target);
+        let store = Arc::new(LifecycleStore {
+            targets: vec![target],
+            history: Mutex::new(LifecycleHistory::default()),
+            commits: Mutex::new(Vec::new()),
+            next_alert: AtomicUsize::new(1),
+        });
+        let leases = Arc::new(FakeLeases {
+            refreshes: AtomicUsize::new(0),
+            runners: AtomicUsize::new(0),
+            releases: Arc::new(Guard {
+                releases: AtomicUsize::new(0),
+                renewals: AtomicUsize::new(0),
+            }),
+        });
+        let monitor = Arc::new(SequenceMonitor(Mutex::new(candidates.into())));
+        let runtime = Runtime::new(
+            store.clone(),
+            leases.clone(),
+            Arc::new(FixedClock),
+            vec![monitor.clone()],
+        );
+        let mut event_kinds = Vec::new();
+        for _ in 0..6 {
+            let report = runtime
+                .refresh(RefreshScope::AllActive, Duration::ZERO, &NeverCancelled)
+                .await
+                .unwrap();
+            event_kinds.extend(report.new_alerts().map(|alert| alert.key.event_kind));
+        }
+        let returned_to_a = runtime
+            .refresh(RefreshScope::AllActive, Duration::ZERO, &NeverCancelled)
+            .await
+            .unwrap();
+        assert_eq!(
+            returned_to_a.subjects[0].observations[0].first_observed_at,
+            Timestamp::parse("2026-09-08T12:00:00Z").unwrap()
+        );
+        assert_eq!(
+            event_kinds,
+            vec![
+                AlertEventKind::Missing,
+                AlertEventKind::Started,
+                AlertEventKind::Terminal,
+                AlertEventKind::Terminal,
+            ]
+        );
+
+        let restarted = Runtime::new(store, leases, Arc::new(FixedClock), vec![monitor]);
+        let report = restarted
+            .refresh(RefreshScope::AllActive, Duration::ZERO, &NeverCancelled)
+            .await
+            .unwrap();
+        assert!(report.new_alerts().next().is_none());
     }
     struct TestCancellation {
         cancelled: std::sync::atomic::AtomicBool,

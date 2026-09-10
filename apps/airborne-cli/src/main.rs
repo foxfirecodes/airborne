@@ -175,6 +175,10 @@ enum RuleAdd {
         watch_id: String,
         #[arg(long, default_value=CHECK)]
         check_name: String,
+        #[arg(long, help = "Alert when Bugbot starts")]
+        alert_on_start: bool,
+        #[arg(long, value_parser = parse_positive_duration, help = "Alert if Bugbot is not detected after this delay (for example, 5m)")]
+        alert_if_missing_after: Option<Duration>,
     },
     #[command(name = "buildkite-job")]
     /// Alert when a Buildkite job completes.
@@ -214,6 +218,14 @@ struct RuleUpdate {
     job: Option<String>,
     #[arg(long, value_enum)]
     notify_on: Option<Notify>,
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_alert_on_start")]
+    alert_on_start: bool,
+    #[arg(long = "no-alert-on-start", action = ArgAction::SetTrue, conflicts_with = "alert_on_start")]
+    no_alert_on_start: bool,
+    #[arg(long, value_parser = parse_positive_duration, conflicts_with = "no_alert_if_missing_after")]
+    alert_if_missing_after: Option<Duration>,
+    #[arg(long = "no-alert-if-missing-after", action = ArgAction::SetTrue, conflicts_with = "alert_if_missing_after")]
+    no_alert_if_missing_after: bool,
 }
 #[derive(Args)]
 struct Refresh {
@@ -476,14 +488,48 @@ fn human(command: &str, data: &Value) -> String {
                 .unwrap_or(0)
         ),
         "status" => rows(data, "watches", |item| {
-            format!(
+            let watch = format!(
                 "{}\t{}\t{} rule(s)",
                 item["watch"]["id"],
                 item["subject"]["current_revision"]
                     .as_str()
                     .unwrap_or("unknown"),
                 item["rules"].as_array().map_or(0, Vec::len)
-            )
+            );
+            let rules = item["rules"].as_array().map_or_else(Vec::new, |rules| {
+                rules
+                    .iter()
+                    .map(|rule| {
+                        let observation = &rule["latest_observation"];
+                        let state = observation["state"]
+                            .as_str()
+                            .map(human_candidate_state)
+                            .unwrap_or("no observation");
+                        let observed = observation["observed_at"].as_str().unwrap_or("never");
+                        let policy = &rule["alert_policy"];
+                        let start = if policy["alert_on_start"].as_bool() == Some(true) {
+                            "start"
+                        } else {
+                            "no-start"
+                        };
+                        let missing = policy["alert_if_missing_after_seconds"]
+                            .as_u64()
+                            .map_or_else(
+                                || "no-missing".to_owned(),
+                                |seconds| format!("missing-after={seconds}s"),
+                            );
+                        format!(
+                            "  {}\t{state}\tlast observed {observed}\t{start}, {missing}",
+                            rule["rule"]["id"]
+                        )
+                    })
+                    .collect()
+            });
+            if rules.is_empty() {
+                watch
+            } else {
+                format!("{watch}\n{}", rules.join("\n"))
+            }
         }),
         _ => serde_json::to_string_pretty(data).unwrap_or_else(|_| "completed".into()),
     }
@@ -724,15 +770,35 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 RuleAdd::Bugbot {
                     watch_id: id,
                     check_name,
+                    alert_on_start,
+                    alert_if_missing_after,
                 } => (
                     watch_id(id)?,
-                    RuleConfig::GitHubCheckCompletes { check_name },
+                    RuleConfig::GitHubCheckCompletes {
+                        check_name,
+                        alert_on_start,
+                        alert_if_missing_after_seconds: alert_if_missing_after
+                            .map(|duration| duration.as_secs()),
+                    },
                 ),
                 RuleAdd::BuildkiteJob(a) => (
                     watch_id(a.watch_id)?,
                     buildkite(a.context, a.organization, a.pipeline, a.job, a.notify_on)?,
                 ),
             };
+            if let Some(existing) = store
+                .list_rules(Some(&watch_id))
+                .map_err(|e| Error::fail(e.to_string()))?
+                .into_iter()
+                .find(|rule| rule.kind == config.kind() && rule.archived_at.is_none())
+            {
+                return Err(Error::input(format!(
+                    "this watch already has a {} rule ({}){}; disabled rules still count, so archive it before adding a replacement",
+                    rule_kind_name(config.kind()),
+                    existing.id,
+                    if existing.enabled { "" } else { ", currently disabled" },
+                )));
+            }
             out.emit(
                 "rule.add",
                 json!(store
@@ -743,7 +809,7 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                         created_at: now()
                     })
                     .await
-                    .map_err(store_err)?),
+                    .map_err(rule_add_err)?),
             )
         }
         RuleSub::Enable { rule_id: id } => set_rule(store, out, id, true, "rule.enable").await,
@@ -773,6 +839,10 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 && update.pipeline.is_none()
                 && update.job.is_none()
                 && update.notify_on.is_none()
+                && !update.alert_on_start
+                && !update.no_alert_on_start
+                && update.alert_if_missing_after.is_none()
+                && !update.no_alert_if_missing_after
             {
                 return Err(Error::input(
                     "rule update requires at least one changed option",
@@ -784,7 +854,11 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 .map_err(|e| Error::fail(e.to_string()))?
                 .ok_or_else(|| Error::fail("rule was not found"))?;
             let config = match definition.config {
-                RuleConfig::GitHubCheckCompletes { check_name } => {
+                RuleConfig::GitHubCheckCompletes {
+                    check_name,
+                    alert_on_start,
+                    alert_if_missing_after_seconds,
+                } => {
                     if update.context.is_some()
                         || update.organization.is_some()
                         || update.pipeline.is_some()
@@ -797,6 +871,21 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     }
                     RuleConfig::GitHubCheckCompletes {
                         check_name: update.check_name.unwrap_or(check_name),
+                        alert_on_start: if update.alert_on_start {
+                            true
+                        } else if update.no_alert_on_start {
+                            false
+                        } else {
+                            alert_on_start
+                        },
+                        alert_if_missing_after_seconds: if update.no_alert_if_missing_after {
+                            None
+                        } else {
+                            update
+                                .alert_if_missing_after
+                                .map(|duration| duration.as_secs())
+                                .or(alert_if_missing_after_seconds)
+                        },
                     }
                 }
                 RuleConfig::BuildkiteJobCompletes {
@@ -808,6 +897,15 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 } => {
                     if update.check_name.is_some() {
                         return Err(Error::input("--check-name cannot update a Buildkite rule"));
+                    }
+                    if update.alert_on_start
+                        || update.no_alert_on_start
+                        || update.alert_if_missing_after.is_some()
+                        || update.no_alert_if_missing_after
+                    {
+                        return Err(Error::input(
+                            "Bugbot alert options cannot update a Buildkite rule",
+                        ));
                     }
                     buildkite(
                         update
@@ -1025,7 +1123,28 @@ fn status(args: Status, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error
     if watch.is_some() && status.watches.is_empty() {
         return Err(Error::fail("watch was not found"));
     }
-    out.emit("status", json!(status))
+    let mut data = json!(status);
+    for watch in data["watches"].as_array_mut().into_iter().flatten() {
+        for rule in watch["rules"].as_array_mut().into_iter().flatten() {
+            let Some(id) = rule["rule"]["id"].as_str() else {
+                continue;
+            };
+            let definition = store
+                .get_rule_definition(&rule_id(id.to_owned())?)
+                .map_err(|e| Error::fail(e.to_string()))?;
+            if let Some(definition) = definition {
+                if let RuleConfig::GitHubCheckCompletes {
+                    alert_on_start,
+                    alert_if_missing_after_seconds,
+                    ..
+                } = definition.config
+                {
+                    rule["alert_policy"] = json!({"alert_on_start": alert_on_start, "alert_if_missing_after_seconds": alert_if_missing_after_seconds});
+                }
+            }
+        }
+    }
+    out.emit("status", data)
 }
 async fn alerts(cmd: AlertsSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error> {
     if let AlertsSub::Show { alert_id } = &cmd {
@@ -1230,8 +1349,41 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         _ => Err("duration unit must be s, m, or h".into()),
     }
 }
+fn parse_positive_duration(s: &str) -> Result<Duration, String> {
+    let duration = parse_duration(s)?;
+    if duration.is_zero() {
+        return Err("duration must be greater than zero".into());
+    }
+    Ok(duration)
+}
+fn human_candidate_state(state: &str) -> &str {
+    match state {
+        "not_detected" => "not detected",
+        "in_progress" => "in progress",
+        other => other,
+    }
+}
 fn store_err(e: airborne_runtime::StoreError) -> Error {
     Error::fail(e.to_string())
+}
+fn rule_add_err(e: airborne_runtime::StoreError) -> Error {
+    match e {
+        airborne_runtime::StoreError::RuleKindConflict {
+            kind,
+            existing_rule_id,
+            ..
+        } => Error::input(format!(
+            "this watch already has a {} rule ({existing_rule_id}); archive it before adding a replacement",
+            rule_kind_name(kind),
+        )),
+        error @ airborne_runtime::StoreError::Failed { .. } => Error::fail(error.to_string()),
+    }
+}
+fn rule_kind_name(kind: airborne_core::RuleKind) -> &'static str {
+    match kind {
+        airborne_core::RuleKind::GitHubCheckCompletes => "Bugbot",
+        airborne_core::RuleKind::BuildkiteJobCompletes => "Buildkite job",
+    }
 }
 fn runtime_err(e: airborne_runtime::RuntimeError) -> Error {
     Error {

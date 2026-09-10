@@ -316,7 +316,12 @@ fn check_candidate(
     snapshot: &PullRequestSnapshot,
 ) -> RulePollResult {
     let rule = &request.rules[index];
-    let RuleConfig::GitHubCheckCompletes { check_name } = &rule.definition.config else {
+    let RuleConfig::GitHubCheckCompletes {
+        check_name,
+        alert_on_start,
+        alert_if_missing_after_seconds,
+    } = &rule.definition.config
+    else {
         return issue_result(
             rule,
             Provider::GitHub,
@@ -326,30 +331,59 @@ fn check_candidate(
         );
     };
     let Some(check) = newest_check(checks, check_name) else {
-        return candidate_result(waiting_candidate(request, rule, snapshot));
+        let mut candidate = base_candidate(
+            request,
+            rule,
+            snapshot,
+            CandidateState::NotDetected,
+            None,
+            None,
+            None,
+        );
+        candidate.alert_intent =
+            alert_if_missing_after_seconds.map(|after_seconds| AlertIntent::Missing {
+                after_seconds,
+                title: format!("{check_name} was not detected"),
+                body: format!("{check_name} has not appeared yet"),
+            });
+        return candidate_result(candidate);
     };
     let source = source(&check.id);
     let conclusion = check
         .conclusion
         .as_deref()
         .map(|value| format!("conclusion: {value}"));
-    let completed = check.status == "completed";
-    let alert_intent = completed.then(|| AlertIntent {
-        source_identity: source.clone(),
-        title: format!("{} completed", check.name),
-        body: conclusion
-            .clone()
-            .unwrap_or_else(|| format!("{} completed", check.name)),
+    let state = match check.status.as_str() {
+        "queued" => CandidateState::Waiting,
+        "completed" => CandidateState::Completed,
+        _ => CandidateState::InProgress,
+    };
+    let started_body = alert_on_start.then(|| match state {
+        CandidateState::Waiting => Some(format!("{check_name} was detected and is queued")),
+        CandidateState::InProgress => Some(format!("{check_name} is running")),
+        _ => None,
     });
+    let alert_intent = started_body
+        .flatten()
+        .map(|body| AlertIntent::Started {
+            source_identity: source.clone(),
+            title: format!("{check_name} started"),
+            body,
+        })
+        .or_else(|| {
+            (state == CandidateState::Completed).then(|| AlertIntent::Terminal {
+                source_identity: source.clone(),
+                title: format!("{check_name} completed"),
+                body: conclusion
+                    .clone()
+                    .unwrap_or_else(|| format!("{check_name} completed")),
+            })
+        });
     candidate_result(Candidate {
         rule_key: rule.key(),
         subject_key: request.subject.key.clone(),
         revision: snapshot.head_revision.clone(),
-        state: if completed {
-            CandidateState::Completed
-        } else {
-            CandidateState::InProgress
-        },
+        state,
         source_identity: Some(source),
         source_url: canonical_github_url(check.details_url.as_deref()),
         detail: conclusion,
@@ -443,7 +477,7 @@ fn build_candidate(
         CandidateState::Failed
     };
     let should_alert = matches!(notify_on, airborne_core::BuildkiteNotifyOn::Terminal) || passed;
-    let alert_intent = should_alert.then(|| AlertIntent {
+    let alert_intent = should_alert.then(|| AlertIntent::Terminal {
         source_identity: source_identity.clone(),
         title: format!(
             "Buildkite job {} {}",
@@ -782,10 +816,19 @@ mod tests {
         }
     }
     fn check_rule(id: &str) -> VersionedRule {
+        check_rule_with_policy(id, false, None)
+    }
+    fn check_rule_with_policy(
+        id: &str,
+        alert_on_start: bool,
+        alert_if_missing_after_seconds: Option<u64>,
+    ) -> VersionedRule {
         rule(
             id,
             RuleConfig::GitHubCheckCompletes {
                 check_name: "Cursor Bugbot".into(),
+                alert_on_start,
+                alert_if_missing_after_seconds,
             },
         )
     }
@@ -922,6 +965,121 @@ mod tests {
         assert_eq!(candidate.state, CandidateState::Completed);
         assert_eq!(candidate.source_identity.as_ref().unwrap().as_str(), "10");
         assert!(candidate.alert_intent.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_lifecycle_and_alert_policy_are_exact() {
+        struct Case {
+            status: Option<&'static str>,
+            alert_on_start: bool,
+            missing_after_seconds: Option<u64>,
+            expected_state: CandidateState,
+            expected_alert: Option<airborne_core::AlertEventKind>,
+            expected_body: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                status: None,
+                alert_on_start: false,
+                missing_after_seconds: None,
+                expected_state: CandidateState::NotDetected,
+                expected_alert: None,
+                expected_body: None,
+            },
+            Case {
+                status: None,
+                alert_on_start: true,
+                missing_after_seconds: Some(60),
+                expected_state: CandidateState::NotDetected,
+                expected_alert: Some(airborne_core::AlertEventKind::Missing),
+                expected_body: Some("Cursor Bugbot has not appeared yet"),
+            },
+            Case {
+                status: Some("queued"),
+                alert_on_start: false,
+                missing_after_seconds: Some(60),
+                expected_state: CandidateState::Waiting,
+                expected_alert: None,
+                expected_body: None,
+            },
+            Case {
+                status: Some("queued"),
+                alert_on_start: true,
+                missing_after_seconds: None,
+                expected_state: CandidateState::Waiting,
+                expected_alert: Some(airborne_core::AlertEventKind::Started),
+                expected_body: Some("Cursor Bugbot was detected and is queued"),
+            },
+            Case {
+                status: Some("in_progress"),
+                alert_on_start: false,
+                missing_after_seconds: Some(60),
+                expected_state: CandidateState::InProgress,
+                expected_alert: None,
+                expected_body: None,
+            },
+            Case {
+                status: Some("in_progress"),
+                alert_on_start: true,
+                missing_after_seconds: None,
+                expected_state: CandidateState::InProgress,
+                expected_alert: Some(airborne_core::AlertEventKind::Started),
+                expected_body: Some("Cursor Bugbot is running"),
+            },
+            Case {
+                status: Some("completed"),
+                alert_on_start: true,
+                missing_after_seconds: Some(60),
+                expected_state: CandidateState::Completed,
+                expected_alert: Some(airborne_core::AlertEventKind::Terminal),
+                expected_body: Some("conclusion: success"),
+            },
+        ];
+        for case in cases {
+            let mut github = empty_github();
+            if let Some(status) = case.status {
+                github.checks = Ok(vec![CheckRun {
+                    id: "check-id".into(),
+                    name: "Cursor Bugbot".into(),
+                    status: status.into(),
+                    conclusion: Some("success".into()),
+                    details_url: None,
+                    started_at: None,
+                }]);
+            }
+            let report = monitor(
+                github,
+                FakeBuildkite {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    build: Err("unused".into()),
+                },
+            )
+            .poll(request(vec![check_rule_with_policy(
+                "c",
+                case.alert_on_start,
+                case.missing_after_seconds,
+            )]))
+            .await;
+            let RulePollResult::Candidate(candidate) = &report.results[0] else {
+                panic!()
+            };
+            assert_eq!(candidate.state, case.expected_state);
+            assert_eq!(
+                candidate.alert_intent.as_ref().map(AlertIntent::event_kind),
+                case.expected_alert
+            );
+            assert_eq!(
+                candidate.alert_intent.as_ref().map(AlertIntent::body),
+                case.expected_body
+            );
+            assert!(
+                !matches!(candidate.alert_intent, Some(AlertIntent::Started { .. }))
+                    || !matches!(
+                        candidate.state,
+                        CandidateState::Completed | CandidateState::Failed
+                    )
+            );
+        }
     }
 
     #[tokio::test]
