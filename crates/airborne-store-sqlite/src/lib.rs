@@ -303,6 +303,23 @@ impl SqliteStore {
     pub fn get_watch(&self, id: &WatchId) -> Result<Option<Watch>> {
         self.connection.lock().expect("SQLite mutex poisoned").query_row("SELECT w.id,s.subject_key,w.state,w.created_at,w.updated_at,w.archived_at FROM watch w JOIN subject s ON s.id=w.subject_id WHERE w.id=?",[id.as_str()],read_watch).optional().map_err(SqliteStoreError::Storage)
     }
+    /// Finds the watch attached to one canonical subject key.
+    pub fn get_watch_id_by_subject_key(&self, key: &SubjectKey) -> Result<Option<WatchId>> {
+        let id = self
+            .connection
+            .lock()
+            .expect("SQLite mutex poisoned")
+            .query_row(
+                "SELECT w.id FROM watch w JOIN subject s ON s.id=w.subject_id WHERE s.subject_key=?",
+                [key.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(SqliteStoreError::Storage)?;
+        id.map(WatchId::new)
+            .transpose()
+            .map_err(|error| SqliteStoreError::Import(error.to_string()))
+    }
     pub fn get_rule(&self, id: &RuleId) -> Result<Option<Rule>> {
         self.connection.lock().expect("SQLite mutex poisoned").query_row("SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=?",[id.as_str()],read_rule).optional().map_err(SqliteStoreError::Storage)
     }

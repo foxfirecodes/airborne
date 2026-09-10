@@ -1195,16 +1195,14 @@ fn resolve_watch_reference(store: &SqliteStore, value: &str) -> Result<WatchId, 
         let pull_request = parse_pull_request_url(value).map_err(|_| {
             Error::input("expected a watch ID or canonical HTTPS GitHub pull request URL")
         })?;
-        let subject_key = format!(
+        let subject_key = SubjectKey::new(format!(
             "github.com/{}/{}/pull/{}",
             pull_request.repository.owner, pull_request.repository.repository, pull_request.number
-        );
+        ))
+        .map_err(|error| Error::input(error.to_string()))?;
         return store
-            .list_watch_views(None)
+            .get_watch_id_by_subject_key(&subject_key)
             .map_err(|error| Error::fail(error.to_string()))?
-            .into_iter()
-            .find(|watch| watch.subject.key.as_str() == subject_key)
-            .map(|watch| watch.watch.id)
             .ok_or_else(|| Error::fail("watch was not found"));
     }
     watch_id(value.to_owned())
