@@ -117,6 +117,15 @@ Last checked   [dim]Sep 10, 2026 at 2:41 PM EDT[/dim]
 
 ## `airborne rule show`
 
+Use the name shown by `rule list` in place of the rule ID. `bugbot` is a short
+name for a GitHub check rule. If the same name exists on more than one watch,
+select the watch with its pull request URL:
+
+```text
+airborne rule show bugbot --watch https://github.com/discord/discord/pull/12345
+airborne rule disable buildkite/discord-admin --watch https://github.com/discord/discord/pull/12345
+```
+
 ```text
 [bold]Cursor Bugbot[/bold]  [green]enabled[/green]
 [bold]discord/discord #12345 — Add guild profiles[/bold]

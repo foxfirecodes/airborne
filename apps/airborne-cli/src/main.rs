@@ -162,16 +162,34 @@ enum RuleSub {
         all: bool,
     },
     /// Show a rule and its current version.
-    Show { rule_id: String },
+    Show {
+        #[arg(value_name = "RULE_ID_OR_NAME")]
+        rule_id: String,
+        #[arg(long, help = "Select the rule on this watch (ID or GitHub PR URL)")]
+        watch: Option<String>,
+    },
     /// Enable a rule and reset its baseline.
-    Enable { rule_id: String },
+    Enable {
+        #[arg(value_name = "RULE_ID_OR_NAME")]
+        rule_id: String,
+        #[arg(long)]
+        watch: Option<String>,
+    },
     /// Disable a rule without deleting its history.
-    Disable { rule_id: String },
+    Disable {
+        #[arg(value_name = "RULE_ID_OR_NAME")]
+        rule_id: String,
+        #[arg(long)]
+        watch: Option<String>,
+    },
     /// Update a rule's matching policy.
     Update(RuleUpdate),
     /// Archive a rule.
     Remove {
+        #[arg(value_name = "RULE_ID_OR_NAME")]
         rule_id: String,
+        #[arg(long)]
+        watch: Option<String>,
         #[arg(long)]
         yes: bool,
     },
@@ -180,7 +198,10 @@ enum RuleSub {
 enum RuleAdd {
     /// Alert when Cursor Bugbot completes.
     Bugbot {
+        #[arg(value_name = "WATCH_ID_OR_GITHUB_PR_URL")]
         watch_id: String,
+        #[arg(long, help = "Replace the current Bugbot rule, if any")]
+        replace: bool,
         #[arg(long, default_value=CHECK)]
         check_name: String,
         #[arg(long, help = "Alert when Bugbot starts")]
@@ -194,7 +215,10 @@ enum RuleAdd {
 }
 #[derive(Args)]
 struct BuildkiteArgs {
+    #[arg(value_name = "WATCH_ID_OR_GITHUB_PR_URL")]
     watch_id: String,
+    #[arg(long, help = "Replace the current Buildkite rule, if any")]
+    replace: bool,
     #[arg(long)]
     context: String,
     #[arg(long)]
@@ -213,7 +237,10 @@ enum Notify {
 }
 #[derive(Args)]
 struct RuleUpdate {
+    #[arg(value_name = "RULE_ID_OR_NAME")]
     rule_id: String,
+    #[arg(long)]
+    watch: Option<String>,
     #[arg(long)]
     check_name: Option<String>,
     #[arg(long)]
@@ -1207,10 +1234,63 @@ fn resolve_watch_reference(store: &SqliteStore, value: &str) -> Result<WatchId, 
     }
     watch_id(value.to_owned())
 }
-fn rule_id(value: String) -> Result<RuleId, Error> {
-    RuleId::new(value).map_err(|e| Error::input(e.to_string()))
-}
 
+fn resolve_rule_reference(
+    store: &SqliteStore,
+    value: &str,
+    watch: Option<&str>,
+) -> Result<RuleId, Error> {
+    if let Ok(id) = RuleId::new(value.to_owned()) {
+        if store
+            .get_rule(&id)
+            .map_err(|error| Error::fail(error.to_string()))?
+            .is_some()
+        {
+            return Ok(id);
+        }
+    }
+
+    let watch_id = watch
+        .map(|reference| resolve_watch_reference(store, reference))
+        .transpose()?;
+    let rules = store
+        .list_rule_views(watch_id.as_ref())
+        .map_err(|error| Error::fail(error.to_string()))?;
+    let matches = rules
+        .into_iter()
+        .filter(|rule| match &rule.definition.config {
+            RuleConfig::GitHubCheckCompletes { check_name, .. } => {
+                value == check_name || value.eq_ignore_ascii_case("bugbot")
+            }
+            RuleConfig::BuildkiteJobCompletes {
+                github_status_context,
+                job_name,
+                ..
+            } => value == github_status_context.as_str() || value == job_name.as_str(),
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(Error::fail(format!("rule `{value}` was not found")));
+    }
+    let current = matches
+        .iter()
+        .filter(|rule| rule.rule.archived_at.is_none())
+        .collect::<Vec<_>>();
+    if current.len() == 1 {
+        return Ok(current[0].rule.id.clone());
+    }
+    if current.len() > 1 || matches.len() > 1 {
+        let help = if watch.is_some() {
+            "use the full rule ID"
+        } else {
+            "add --watch <GITHUB_PR_URL>"
+        };
+        return Err(Error::input(format!(
+            "rule name `{value}` matches more than one rule; {help}"
+        )));
+    }
+    Ok(matches[0].rule.id.clone())
+}
 #[derive(Clone, Copy)]
 enum CredentialSource {
     Environment,
@@ -1427,7 +1507,10 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
         all,
     } = &cmd
     {
-        let watch = watch.clone().map(watch_id).transpose()?;
+        let watch = watch
+            .as_deref()
+            .map(|reference| resolve_watch_reference(store, reference))
+            .transpose()?;
         let mut rules = store
             .list_rule_views(watch.as_ref())
             .map_err(|e| Error::fail(e.to_string()))?;
@@ -1438,24 +1521,27 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
     }
     match cmd {
         RuleSub::Add { kind } => {
-            let (watch_id, config) = match kind {
+            let (watch_id, config, replace) = match kind {
                 RuleAdd::Bugbot {
                     watch_id: id,
+                    replace,
                     check_name,
                     alert_on_start,
                     alert_if_missing_after,
                 } => (
-                    watch_id(id)?,
+                    resolve_watch_reference(store, &id)?,
                     RuleConfig::GitHubCheckCompletes {
                         check_name,
                         alert_on_start,
                         alert_if_missing_after_seconds: alert_if_missing_after
                             .map(|duration| duration.as_secs()),
                     },
+                    replace,
                 ),
                 RuleAdd::BuildkiteJob(a) => (
-                    watch_id(a.watch_id)?,
+                    resolve_watch_reference(store, &a.watch_id)?,
                     buildkite(a.context, a.organization, a.pipeline, a.job, a.notify_on)?,
+                    a.replace,
                 ),
             };
             if let Some(existing) = store
@@ -1464,46 +1550,70 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 .into_iter()
                 .find(|rule| rule.kind == config.kind() && rule.archived_at.is_none())
             {
-                return Err(Error::input(format!(
-                    "this watch already has a {} rule ({}){}; disabled rules still count, so archive it before adding a replacement",
-                    rule_kind_name(config.kind()),
-                    existing.id,
-                    if existing.enabled { "" } else { ", currently disabled" },
-                )));
+                if !replace {
+                    return Err(Error::input(format!(
+                        "this watch already has a {} rule ({}){}; pass --replace to replace it",
+                        rule_kind_name(config.kind()),
+                        existing.id,
+                        if existing.enabled {
+                            ""
+                        } else {
+                            ", currently disabled"
+                        },
+                    )));
+                }
             }
+            let draft = NewRule {
+                watch_id,
+                config,
+                enabled: true,
+                created_at: now(),
+            };
             out.emit(
                 "rule.add",
-                json!(store
-                    .add_rule(NewRule {
-                        watch_id,
-                        config,
-                        enabled: true,
-                        created_at: now()
-                    })
-                    .await
-                    .map_err(rule_add_err)?),
+                json!(if replace {
+                    store.replace_rule(draft).await
+                } else {
+                    store.add_rule(draft).await
+                }
+                .map_err(rule_add_err)?),
             )
         }
-        RuleSub::Enable { rule_id: id } => set_rule(store, out, id, true, "rule.enable").await,
-        RuleSub::Disable { rule_id: id } => set_rule(store, out, id, false, "rule.disable").await,
-        RuleSub::Remove { rule_id: id, yes } => {
+        RuleSub::Enable { rule_id: id, watch } => {
+            set_rule(store, out, id, watch, true, "rule.enable").await
+        }
+        RuleSub::Disable { rule_id: id, watch } => {
+            set_rule(store, out, id, watch, false, "rule.disable").await
+        }
+        RuleSub::Remove {
+            rule_id: id,
+            watch,
+            yes,
+        } => {
+            let id = resolve_rule_reference(store, &id, watch.as_deref())?;
             confirm(yes, "archive this rule")?;
             store
-                .archive_rule(&rule_id(id)?, &now())
+                .archive_rule(&id, &now())
                 .map_err(|e| Error::fail(e.to_string()))?;
             out.emit("rule.remove", json!({"archived": true}))
         }
         RuleSub::List { watch, .. } => {
-            let watch = watch.map(watch_id).transpose()?;
+            let watch = watch
+                .as_deref()
+                .map(|reference| resolve_watch_reference(store, reference))
+                .transpose()?;
             out.emit("rule.list", json!({"rules":store.list_rules(watch.as_ref()).map_err(|e|Error::fail(e.to_string()))?}))
         }
-        RuleSub::Show { rule_id: id } => out.emit(
-            "rule.show",
-            json!(store
-                .get_rule_view(&rule_id(id)?)
-                .map_err(|e| Error::fail(e.to_string()))?
-                .ok_or_else(|| Error::fail("rule was not found"))?),
-        ),
+        RuleSub::Show { rule_id: id, watch } => {
+            let id = resolve_rule_reference(store, &id, watch.as_deref())?;
+            out.emit(
+                "rule.show",
+                json!(store
+                    .get_rule_view(&id)
+                    .map_err(|e| Error::fail(e.to_string()))?
+                    .ok_or_else(|| Error::fail("rule was not found"))?),
+            )
+        }
         RuleSub::Update(update) => {
             if update.check_name.is_none()
                 && update.context.is_none()
@@ -1520,7 +1630,7 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     "rule update requires at least one changed option",
                 ));
             }
-            let id = rule_id(update.rule_id)?;
+            let id = resolve_rule_reference(store, &update.rule_id, update.watch.as_deref())?;
             let definition = store
                 .get_rule_definition(&id)
                 .map_err(|e| Error::fail(e.to_string()))?
@@ -1636,13 +1746,15 @@ async fn set_rule(
     store: &Arc<SqliteStore>,
     out: &Out,
     id: String,
+    watch: Option<String>,
     on: bool,
     command: &str,
 ) -> Result<(), Error> {
+    let id = resolve_rule_reference(store, &id, watch.as_deref())?;
     out.emit(
         command,
         json!(store
-            .change_rule_state(rule_id(id)?, on, now())
+            .change_rule_state(id, on, now())
             .await
             .map_err(store_err)?),
     )

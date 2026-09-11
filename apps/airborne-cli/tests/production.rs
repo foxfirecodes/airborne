@@ -473,10 +473,6 @@ fn human_views_prioritize_pull_requests_names_and_states() {
     let data = data_dir();
     let (_source, _) = imported_fixture(&data);
     let pull_request_url = "https://github.com/owner/repo/pull/7";
-    let rule_id = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"][0]["id"]
-        .as_str()
-        .expect("rule id")
-        .to_owned();
     let alert_id = offline_json(&data, &["alerts", "list", "--all"])["data"]["alerts"][0]["id"]
         .as_str()
         .expect("alert id")
@@ -503,7 +499,7 @@ fn human_views_prioritize_pull_requests_names_and_states() {
             vec!["Rules", "Cursor Bugbot", "owner/repo #7 — A title"],
         ),
         (
-            vec!["rule", "show", &rule_id],
+            vec!["rule", "show", "bugbot", "--watch", pull_request_url],
             vec!["Check name", "Alerts", "When completed"],
         ),
         (
@@ -527,6 +523,136 @@ fn human_views_prioritize_pull_requests_names_and_states() {
             );
         }
     }
+}
+
+#[test]
+fn human_rule_references_address_rule_commands() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let pull_request_url = "https://github.com/owner/repo/pull/7";
+
+    let shown = offline_json(
+        &data,
+        &["rule", "show", "bugbot", "--watch", pull_request_url],
+    );
+    assert_eq!(
+        shown["data"]["definition"]["config"]["check_name"],
+        "Cursor Bugbot"
+    );
+
+    offline_json(
+        &data,
+        &[
+            "rule",
+            "update",
+            "bugbot",
+            "--watch",
+            pull_request_url,
+            "--check-name",
+            "buildkite/discord-admin",
+        ],
+    );
+    let named = offline_json(
+        &data,
+        &[
+            "rule",
+            "show",
+            "buildkite/discord-admin",
+            "--watch",
+            pull_request_url,
+        ],
+    );
+    assert_eq!(
+        named["data"]["definition"]["config"]["check_name"],
+        "buildkite/discord-admin"
+    );
+
+    offline_json(
+        &data,
+        &[
+            "rule",
+            "disable",
+            "buildkite/discord-admin",
+            "--watch",
+            pull_request_url,
+        ],
+    );
+    let enabled = offline_json(
+        &data,
+        &["rule", "enable", "bugbot", "--watch", pull_request_url],
+    );
+    assert_eq!(enabled["data"]["enabled"], true);
+}
+
+#[test]
+fn pull_request_url_addresses_rule_add() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let pull_request_url = "https://github.com/owner/repo/pull/7";
+    let rule_id = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"][0]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_owned();
+
+    offline_json(&data, &["rule", "remove", &rule_id, "--yes"]);
+    let added = offline_json(&data, &["rule", "add", "bugbot", pull_request_url]);
+    let watch = offline_json(&data, &["watch", "show", pull_request_url]);
+
+    assert_eq!(added["data"]["watch_id"], watch["data"]["id"]);
+
+    let removed = offline_json(
+        &data,
+        &[
+            "rule",
+            "remove",
+            "--watch",
+            pull_request_url,
+            "bugbot",
+            "--yes",
+        ],
+    );
+    assert_eq!(removed["data"]["archived"], true);
+}
+
+#[test]
+fn rule_add_replace_archives_current_rule_and_keeps_history() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let pull_request_url = "https://github.com/owner/repo/pull/7";
+    let before = offline_json(&data, &["rule", "list", "--all"]);
+    let old_id = before["data"]["rules"][0]["id"]
+        .as_str()
+        .expect("old rule id");
+    let old_alert_id = offline_json(&data, &["alerts", "list", "--all"])["data"]["alerts"][0]["id"]
+        .as_str()
+        .expect("old alert id")
+        .to_owned();
+
+    let added = offline_json(
+        &data,
+        &[
+            "rule",
+            "add",
+            "bugbot",
+            pull_request_url,
+            "--replace",
+            "--check-name",
+            "buildkite/discord-admin",
+        ],
+    );
+    assert_ne!(added["data"]["id"], old_id);
+
+    let rules = offline_json(&data, &["rule", "list", "--all"]);
+    assert_eq!(rules["data"]["rules"].as_array().unwrap().len(), 2);
+    assert!(rules["data"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|rule| rule["id"] == old_id && !rule["archived_at"].is_null()));
+    assert_eq!(
+        offline_json(&data, &["alerts", "show", &old_alert_id])["data"]["id"],
+        old_alert_id
+    );
 }
 
 #[test]
@@ -1043,7 +1169,7 @@ fn bugbot_alert_options_update_and_clear() {
 }
 
 #[test]
-fn duplicate_bugbot_rules_require_archiving_before_replacement() {
+fn duplicate_bugbot_rules_require_replace_or_archiving() {
     let data = data_dir();
     let (watch_id, rule_id) = imported_watch_rule(&data);
     let duplicate = airborne()
@@ -1055,7 +1181,7 @@ fn duplicate_bugbot_rules_require_archiving_before_replacement() {
     assert_eq!(duplicate.status.code(), Some(2));
     let duplicate = String::from_utf8_lossy(&duplicate.stderr);
     assert!(duplicate.contains(&rule_id));
-    assert!(duplicate.contains("archive"));
+    assert!(duplicate.contains("--replace"));
 
     airborne()
         .args(["--json", "--data-dir"])

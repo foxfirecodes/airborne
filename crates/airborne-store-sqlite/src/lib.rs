@@ -300,6 +300,69 @@ impl SqliteStore {
         }
         Ok(())
     }
+    /// Creates a rule, atomically archiving the current rule of the same kind.
+    pub async fn replace_rule(&self, draft: NewRule) -> std::result::Result<Rule, StoreError> {
+        draft.config.validate().map_err(store_error)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let watch_state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM watch WHERE id=?",
+                [draft.watch_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_error)?;
+        match watch_state.as_deref() {
+            None => {
+                return Err(store_error(format!(
+                    "watch {} was not found",
+                    draft.watch_id
+                )))
+            }
+            Some("archived") => {
+                return Err(store_error(format!("watch {} is archived", draft.watch_id)))
+            }
+            _ => {}
+        }
+
+        let at = sql_timestamp(&draft.created_at);
+        transaction
+            .execute(
+                "UPDATE rule SET state='archived',enabled=0,updated_at=?,archived_at=? WHERE watch_id=? AND kind=? AND state='active'",
+                params![at, at, draft.watch_id.as_str(), rule_kind_text(draft.config.kind())],
+            )
+            .map_err(store_error)?;
+
+        let id = RuleId::new(uid("rule")).map_err(store_error)?;
+        let definition = serde_json::to_string(&draft.config).map_err(store_error)?;
+        transaction
+            .execute(
+                "INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)",
+                params![id.as_str(), draft.watch_id.as_str(), rule_kind_text(draft.config.kind()), draft.enabled, at, at],
+            )
+            .map_err(store_error)?;
+        transaction
+            .execute(
+                "INSERT INTO rule_definition(rule_id,version,encoding_version,definition,created_at) VALUES (?,1,1,?,?)",
+                params![id.as_str(), definition, at],
+            )
+            .map_err(store_error)?;
+        let rule = transaction
+            .query_row(
+                "SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=?",
+                [id.as_str()],
+                read_rule,
+            )
+            .map_err(store_error)?;
+        transaction.commit().map_err(store_error)?;
+        Ok(rule)
+    }
     pub fn get_watch(&self, id: &WatchId) -> Result<Option<Watch>> {
         self.connection.lock().expect("SQLite mutex poisoned").query_row("SELECT w.id,s.subject_key,w.state,w.created_at,w.updated_at,w.archived_at FROM watch w JOIN subject s ON s.id=w.subject_id WHERE w.id=?",[id.as_str()],read_watch).optional().map_err(SqliteStoreError::Storage)
     }

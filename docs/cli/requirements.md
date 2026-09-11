@@ -132,28 +132,38 @@ airborne watch remove <WATCH_ID_OR_GITHUB_PR_URL> [--yes]
 ### 3.4 Rule commands
 
 ```text
-airborne rule add bugbot <WATCH_ID> [--check-name <NAME>] \
+airborne rule add bugbot <WATCH_ID_OR_GITHUB_PR_URL> [--check-name <NAME>] \
+  [--replace] \
   [--alert-on-start] \
   [--alert-if-missing-after <DURATION>]
 
-airborne rule add buildkite-job <WATCH_ID> \
+airborne rule add buildkite-job <WATCH_ID_OR_GITHUB_PR_URL> \
   --context <GITHUB_STATUS_CONTEXT> \
   --organization <ORGANIZATION> \
   --pipeline <PIPELINE> \
   --job <EXACT_JOB_NAME> \
+  [--replace] \
   [--notify-on terminal|passed]
 
-airborne rule list [--watch <WATCH_ID>] [--enabled|--all]
-airborne rule show <RULE_ID>
-airborne rule enable <RULE_ID>
-airborne rule disable <RULE_ID>
-airborne rule update <RULE_ID> [KIND-SPECIFIC OPTIONS] \
+airborne rule list [--watch <WATCH_ID_OR_GITHUB_PR_URL>] [--enabled|--all]
+airborne rule show <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>]
+airborne rule enable <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>]
+airborne rule disable <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>]
+airborne rule update <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>] [KIND-SPECIFIC OPTIONS] \
   [--alert-on-start|--no-alert-on-start] \
   [--alert-if-missing-after <DURATION>|--no-alert-if-missing-after]
-airborne rule remove <RULE_ID> [--yes]
+airborne rule remove <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>] [--yes]
 ```
 
 - The default Bugbot check name must be `Cursor Bugbot`.
+- `rule add --replace` must archive the current non-archived rule of the same
+  kind and create the requested rule in one transaction. With no current rule,
+  it must act like a normal add. Past alerts and observations must remain.
+- Rule commands must accept a full rule ID or a stable human name. `bugbot`
+  identifies the GitHub check rule on a watch. An exact GitHub check name,
+  Buildkite status context, or Buildkite job name also identifies its rule.
+  A name that occurs on more than one watch must fail and tell the user to add
+  `--watch`; a GitHub pull request URL is valid there.
 - Bugbot completion alerts are on by default. Start and missing alerts are off
   by default.
 - `--alert-on-start` enables a start alert and `--no-alert-on-start` disables
