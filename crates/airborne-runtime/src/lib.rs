@@ -247,6 +247,7 @@ pub trait Sleeper: Send + Sync {
 pub struct SubjectRefreshReport {
     pub watch_id: WatchId,
     pub subject_key: SubjectKey,
+    pub subject_title: String,
     pub outcome: PollOutcome,
     pub observations: Vec<Observation>,
     pub issues: Vec<SourceIssueDraft>,
@@ -539,6 +540,7 @@ impl Runtime {
         Ok(SubjectRefreshReport {
             watch_id: target.watch.id,
             subject_key: target.subject.key,
+            subject_title: target.subject.display_title,
             outcome,
             observations,
             issues,
@@ -610,6 +612,7 @@ fn canceled_subject(target: &RefreshTarget) -> SubjectRefreshReport {
     SubjectRefreshReport {
         watch_id: target.watch.id.clone(),
         subject_key: target.subject.key.clone(),
+        subject_title: target.subject.display_title.clone(),
         outcome: PollOutcome::Canceled,
         observations: Vec::new(),
         issues: Vec::new(),

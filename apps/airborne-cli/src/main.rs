@@ -2360,14 +2360,20 @@ async fn run(args: Run, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error
         .map_err(runtime_err)
 }
 fn notify_alerts(report: &RefreshReport) {
-    for alert in report.new_alerts() {
-        if let Err(error) = send_notification(&alert.title, &alert.body) {
-            eprintln!(
-                "airborne: could not send system notification for alert {}: {error}",
-                alert.id
-            );
+    for subject in &report.subjects {
+        for alert in &subject.new_alerts {
+            let body = notification_body(&alert.title, &alert.body);
+            if let Err(error) = send_notification(&subject.subject_title, &body) {
+                eprintln!(
+                    "airborne: could not send system notification for alert {}: {error}",
+                    alert.id
+                );
+            }
         }
     }
+}
+fn notification_body(alert_title: &str, alert_body: &str) -> String {
+    format!("{alert_title}\n{alert_body}")
 }
 fn send_notification(summary: &str, body: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -2805,6 +2811,14 @@ mod tests {
             "latest_observation":null
         });
         assert!(render_rule_show(&rule, false).contains("Organization     acme"));
+    }
+
+    #[test]
+    fn notification_shows_alert_details_below_the_subject_title() {
+        assert_eq!(
+            notification_body("Cursor Bugbot started", "The check is now running."),
+            "Cursor Bugbot started\nThe check is now running."
+        );
     }
 
     #[test]
