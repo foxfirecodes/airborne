@@ -25,6 +25,7 @@ must be testable without a window or desktop automation.
 - Commands to manage watches, rules, alerts, credentials, and settings.
 - A one-shot refresh command.
 - A foreground polling command with clean shutdown.
+- A system notification for each new alert created by `refresh` or `run`.
 - Human-readable output and versioned JSON output.
 - Exact rule behavior and alert lifecycle from the domain model.
 - Stable exit codes.
@@ -33,7 +34,7 @@ must be testable without a window or desktop automation.
 
 ### 2.2 Not required for version 1
 
-- A desktop app, tray icon, web view, or native notification.
+- A desktop app, tray icon, or web view.
 - A background launch agent or installer.
 - A hosted service, account, sync, webhook, or OAuth flow.
 - GitLab, Bitbucket, issues, deploys, or non-PR subjects.
@@ -252,7 +253,7 @@ airborne config get [KEY]
 airborne config set poll-interval <DURATION>
 airborne config path
 
-airborne doctor [--live]
+airborne doctor [--live] [--test-notifications]
 
 airborne migrate prototype [--from <DATABASE>] [--credentials] [--dry-run]
 ```
@@ -287,6 +288,9 @@ airborne migrate prototype [--from <DATABASE>] [--credentials] [--dry-run]
   without making network requests.
 - `doctor --live` must also make the least costly authenticated request to each
   configured provider. It must not mutate remote state.
+- `doctor --test-notifications` must send one sample system notification and
+  fail if the host notification service rejects it. It must not need provider
+  access.
 - `migrate prototype` must discover the standard prototype database when
   `--from` is absent, print a plan with `--dry-run`, and require confirmation
   before the first real import.

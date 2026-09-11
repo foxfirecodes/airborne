@@ -18,6 +18,10 @@ alert when its check starts or stays undetected past a configured delay. It has
 no required
 desktop app, web view, tray icon, or hosted service.
 
+Both `refresh` and `run` send a system notification for every new alert. This
+includes start, missing, passed, and failed alerts. The alert remains stored if
+the host cannot show the notification.
+
 The CLI is the product host, not a test shell around a future desktop app. A
 later desktop host may use the same runtime, but it must not move policy out of
 the shared crates or weaken the CLI contract.

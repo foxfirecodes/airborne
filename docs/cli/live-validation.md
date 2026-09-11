@@ -20,6 +20,7 @@ Use this record for a user-approved, read-only validation against a known pull r
 | --- | --- | ---: |
 | Local storage and credentials | `airborne doctor` | |
 | Read-only provider access | `airborne doctor --live` | |
+| System notifications | `airborne doctor --test-notifications` | |
 | GitHub PR and head revision lookup | `airborne refresh` | |
 | Bugbot completed neutral evaluation | Redacted refresh result | |
 | GitHub status resolves to the configured Buildkite build | Redacted refresh result | |

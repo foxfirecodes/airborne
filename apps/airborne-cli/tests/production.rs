@@ -237,6 +237,7 @@ fn every_public_command_group_and_nested_command_has_useful_help() {
         &["alerts", "--help"],
         &["auth", "--help"],
         &["config", "--help"],
+        &["doctor", "--help"],
         &["migrate", "--help"],
         &["watch", "add", "--help"],
         &["rule", "add", "buildkite-job", "--help"],

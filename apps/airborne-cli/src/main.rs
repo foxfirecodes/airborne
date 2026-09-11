@@ -40,6 +40,7 @@ use airborne_store_sqlite::{
 };
 use chrono::{DateTime, Local, Utc};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use notify_rust::Notification;
 use serde_json::{json, Value};
 
 const CHECK: &str = "Cursor Bugbot";
@@ -356,6 +357,8 @@ enum ConfigKey {
 struct Doctor {
     #[arg(long)]
     live: bool,
+    #[arg(long, help = "Send a test system notification")]
+    test_notifications: bool,
 }
 #[derive(Args)]
 struct Migrate {
@@ -1810,6 +1813,7 @@ async fn refresh(args: Refresh, store: &Arc<SqliteStore>, out: &Out) -> Result<(
         .refresh(scope, args.wait, &NeverCancelled)
         .await
         .map_err(runtime_err)?;
+    notify_alerts(&report);
     show_refresh("refresh", &report, out)
 }
 async fn run(args: Run, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error> {
@@ -1844,6 +1848,7 @@ async fn run(args: Run, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error
     let mut sequence = 0_u64;
     let mut handler = |r: &RefreshReport| {
         sequence += 1;
+        notify_alerts(r);
         if out.json {
             let outcome = match r.outcome {
                 airborne_core::PollOutcome::Success => "success",
@@ -1863,6 +1868,38 @@ async fn run(args: Run, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error
         .run(interval, &TokioSleep, cancel.as_ref(), &mut handler)
         .await
         .map_err(runtime_err)
+}
+fn notify_alerts(report: &RefreshReport) {
+    for alert in report.new_alerts() {
+        if let Err(error) = send_notification(&alert.title, &alert.body) {
+            eprintln!(
+                "airborne: could not send system notification for alert {}: {error}",
+                alert.id
+            );
+        }
+    }
+}
+fn send_notification(summary: &str, body: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    prepare_macos_notifications()?;
+    Notification::new()
+        .appname("Airborne")
+        .summary(summary)
+        .body(body)
+        .show()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+#[cfg(target_os = "macos")]
+fn prepare_macos_notifications() -> Result<(), String> {
+    use std::sync::OnceLock;
+
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            notify_rust::set_application("com.apple.Terminal").map_err(|error| error.to_string())
+        })
+        .clone()
 }
 fn show_refresh(command: &str, r: &RefreshReport, out: &Out) -> Result<(), Error> {
     let data = refresh_data(r);
@@ -2090,7 +2127,17 @@ async fn doctor(
     } else {
         json!(null)
     };
-    out.emit("doctor",json!({"data_dir":dir,"schema_version":store.schema_version().map_err(|e|Error::fail(e.to_string()))?,"storage":"ok","github":source(ProviderCredential::GitHub)?,"buildkite":source(ProviderCredential::Buildkite)?,"leases":leases,"live":live}))
+    let notification_test = if args.test_notifications {
+        send_notification(
+            "Airborne notifications work",
+            "You will get a notification when Airborne creates an alert.",
+        )
+        .map_err(|error| Error::fail(format!("system notification test failed: {error}")))?;
+        json!("sent")
+    } else {
+        json!(null)
+    };
+    out.emit("doctor",json!({"data_dir":dir,"schema_version":store.schema_version().map_err(|e|Error::fail(e.to_string()))?,"storage":"ok","github":source(ProviderCredential::GitHub)?,"buildkite":source(ProviderCredential::Buildkite)?,"leases":leases,"live":live,"notification_test":notification_test}))
 }
 fn migrate(cmd: MigrateSub, dir: &Path, out: &Out) -> Result<(), Error> {
     match cmd {

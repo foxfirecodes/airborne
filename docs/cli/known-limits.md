@@ -4,7 +4,8 @@
 
 - Airborne supports macOS only. Windows and Linux are not supported releases.
 - It watches GitHub pull requests only. It does not support issues, other Git hosts, webhooks, sync, OAuth, hosted accounts, job control, or CI log reads.
-- It polls in the foreground. It does not install a background service or send native notifications.
+- It polls in the foreground and sends a system notification for each new alert. It does not install a background service.
+- System notifications depend on the host notification service and the user's notification settings. A notification failure does not discard the stored alert or stop polling.
 - One `run` process may own a data directory. A refresh may run while it sleeps, but refreshes for that directory do not overlap.
 - Poll intervals range from 30 seconds to 24 hours. Runtime concurrency is fixed at four subjects and eight provider requests.
 - Buildkite matching is exact and case-sensitive for context, organization, pipeline, and job name.
