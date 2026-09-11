@@ -1,7 +1,7 @@
 # Human output contract
 
-This document fixes the human output for `status`, `watch`, `rule`, and
-`alerts`. It complements the stable JSON contract in
+This document fixes the human output for `status`, `watch`, `preset`, `rule`,
+and `alerts`. It complements the stable JSON contract in
 [`requirements.md`](requirements.md). JSON remains uncolored and keeps its
 existing machine-readable fields; human output may evolve only by updating this
 contract.
@@ -71,6 +71,41 @@ The samples use styling labels rather than literal escape sequences:
 The canonical pull request URL shown here may be passed directly to
 `watch show` and `watch remove`. Both commands continue to accept a watch ID.
 
+## `airborne preset list`
+
+```text
+[bold]Presets[/bold]
+
+[bold]standard[/bold]  [green]active[/green]
+  [dim]preset_01JA…[/dim]
+  Checks we use on every pull request
+
+[bold]legacy[/bold]  [dim]archived[/dim]
+  [dim]preset_01JD…[/dim]
+```
+
+An empty list says `No presets.`.
+`preset list --all` includes archived presets; the default list omits them.
+
+## `airborne preset show`
+
+```text
+[bold]standard[/bold]
+ID              [dim]preset_01JA…[/dim]
+Description     Checks we use on every pull request
+State           [green]active[/green]
+
+[bold]Preset rules[/bold]
+  [bold]Cursor Bugbot[/bold]  [dim]preset_rule_01JB…[/dim]
+    Alert when started
+  [bold]Buildkite · test-linux[/bold]  [dim]preset_rule_01JC…[/dim]
+    Alert on terminal result
+```
+
+Preset rules show their alert policy but never an enabled state, version,
+observation, or alert history.
+`airborne rule list --preset standard` uses the same `Preset rules` rows.
+
 ## `airborne watch show`
 
 ```text
@@ -116,6 +151,16 @@ Last checked   [dim]Sep 10, 2026 at 2:41 PM EDT[/dim]
 ```
 
 ## `airborne rule show`
+
+When `--preset` selects a preset rule, its output identifies it as `Preset
+rule` and shows its alert policy. Watch rules retain the full runtime output
+below.
+
+```text
+[bold]Cursor Bugbot[/bold]
+ID              [dim]preset_rule_01JB…[/dim]
+Alert when started
+```
 
 Use the name shown by `rule list` in place of the rule ID. `bugbot` is a short
 name for a GitHub check rule. If the same name exists on more than one watch,

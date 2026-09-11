@@ -12,9 +12,10 @@ use std::{
 };
 
 use airborne_core::{
-    Alert, AlertEventKind, AlertId, AlertKey, CandidateState, Observation, Rule, RuleConfig,
-    RuleDefinition, RuleHistory, RuleHistorySet, RuleId, RuleKey, RuleKind, RuleVersion,
-    SourceIdentity, Subject, SubjectKey, Timestamp, VersionedRule, Watch, WatchId, WatchState,
+    Alert, AlertEventKind, AlertId, AlertKey, CandidateState, Observation, Preset, PresetId,
+    PresetRule, PresetRuleId, Rule, RuleConfig, RuleDefinition, RuleHistory, RuleHistorySet,
+    RuleId, RuleKey, RuleKind, RuleVersion, SourceIdentity, Subject, SubjectKey, Timestamp,
+    VersionedRule, Watch, WatchId, WatchState,
 };
 use airborne_runtime::{
     LeaseError, LeaseGuard, LeaseStore, RefreshLease, RefreshScope, RefreshTarget, RunnerLease,
@@ -27,7 +28,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const LATEST_SCHEMA: i64 = 6;
+const LATEST_SCHEMA: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
@@ -162,6 +163,20 @@ pub struct RuleChange {
     pub at: Timestamp,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPreset {
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetRuleChange {
+    pub id: PresetRuleId,
+    pub config: RuleConfig,
+    pub at: Timestamp,
+}
+
 /// Command repositories intentionally use domain records.  The CLI has no SQL
 /// knowledge and can use these narrow methods directly.
 #[async_trait]
@@ -199,6 +214,60 @@ pub trait AlertRepository: Send + Sync {
         ids: &[AlertId],
         at: Timestamp,
     ) -> std::result::Result<usize, StoreError>;
+}
+
+/// Storage commands for reusable preset definitions. Applying a preset always
+/// creates new, enabled runtime rules at version one.
+#[async_trait]
+pub trait PresetRepository: Send + Sync {
+    async fn add_preset(&self, draft: NewPreset) -> std::result::Result<Preset, StoreError>;
+    async fn list_presets(
+        &self,
+        include_archived: bool,
+    ) -> std::result::Result<Vec<Preset>, StoreError>;
+    async fn get_preset(&self, id: PresetId) -> std::result::Result<Option<Preset>, StoreError>;
+    async fn rename_preset(
+        &self,
+        id: PresetId,
+        name: String,
+        at: Timestamp,
+    ) -> std::result::Result<Preset, StoreError>;
+    async fn archive_preset(
+        &self,
+        id: PresetId,
+        at: Timestamp,
+    ) -> std::result::Result<Preset, StoreError>;
+    async fn add_preset_rule(
+        &self,
+        preset_id: PresetId,
+        config: RuleConfig,
+        at: Timestamp,
+    ) -> std::result::Result<PresetRule, StoreError>;
+    async fn update_preset_rule(
+        &self,
+        change: PresetRuleChange,
+    ) -> std::result::Result<PresetRule, StoreError>;
+    async fn remove_preset_rule(
+        &self,
+        id: PresetRuleId,
+        at: Timestamp,
+    ) -> std::result::Result<(), StoreError>;
+    async fn list_preset_rules(
+        &self,
+        preset_id: PresetId,
+    ) -> std::result::Result<Vec<PresetRule>, StoreError>;
+    async fn add_watch_from_preset(
+        &self,
+        preset_id: PresetId,
+        draft: NewWatch,
+    ) -> std::result::Result<Watch, StoreError>;
+    async fn apply_preset(
+        &self,
+        preset_id: PresetId,
+        watch_id: WatchId,
+        replace: bool,
+        at: Timestamp,
+    ) -> std::result::Result<Vec<Rule>, StoreError>;
 }
 
 impl SqliteStore {
@@ -323,10 +392,10 @@ impl SqliteStore {
                 return Err(store_error(format!(
                     "watch {} was not found",
                     draft.watch_id
-                )))
+                )));
             }
             Some("archived") => {
-                return Err(store_error(format!("watch {} is archived", draft.watch_id)))
+                return Err(store_error(format!("watch {} is archived", draft.watch_id)));
             }
             _ => {}
         }
@@ -1510,6 +1579,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     }
+    if current <= 6 {
+        let tx = connection
+            .transaction()
+            .map_err(SqliteStoreError::Storage)?;
+        migrate_v7(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (7)", [])
+            .map_err(SqliteStoreError::Storage)?;
+        tx.commit().map_err(SqliteStoreError::Storage)?;
+    }
     Ok(())
 }
 
@@ -1656,6 +1734,503 @@ fn create_v1(tx: &Transaction<'_>) -> Result<()> {
     "#).map_err(SqliteStoreError::Storage)
 }
 
+fn migrate_v7(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE preset (\
+           id TEXT PRIMARY KEY,\
+           name TEXT NOT NULL UNIQUE,\
+           description TEXT,\
+           state TEXT NOT NULL CHECK(state IN ('active','archived')),\
+           created_at TEXT NOT NULL,\
+           updated_at TEXT NOT NULL,\
+           archived_at TEXT\
+         );\
+         CREATE TABLE preset_rule (\
+           id TEXT PRIMARY KEY,\
+           preset_id TEXT NOT NULL REFERENCES preset(id),\
+           kind TEXT NOT NULL,\
+           definition TEXT NOT NULL,\
+           created_at TEXT NOT NULL,\
+           updated_at TEXT NOT NULL,\
+           UNIQUE(preset_id, kind)\
+         );\
+         CREATE INDEX preset_rule_preset ON preset_rule(preset_id, created_at, kind);",
+    )
+    .map_err(SqliteStoreError::Storage)
+}
+
+fn read_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Preset> {
+    let id: String = row.get(0)?;
+    let name: String = row.get(1)?;
+    let description: Option<String> = row.get(2)?;
+    let created_at: String = row.get(3)?;
+    let updated_at: String = row.get(4)?;
+    let archived_at: Option<String> = row.get(5)?;
+    Ok(Preset {
+        id: PresetId::new(id).map_err(domain_sql)?,
+        name,
+        description,
+        created_at: text_timestamp(created_at).map_err(store_sql)?,
+        updated_at: text_timestamp(updated_at).map_err(store_sql)?,
+        archived_at: archived_at
+            .map(text_timestamp)
+            .transpose()
+            .map_err(store_sql)?,
+    })
+}
+
+fn read_preset_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<PresetRule> {
+    let id: String = row.get(0)?;
+    let preset_id: String = row.get(1)?;
+    let definition: String = row.get(2)?;
+    let created_at: String = row.get(3)?;
+    let updated_at: String = row.get(4)?;
+    Ok(PresetRule {
+        id: PresetRuleId::new(id).map_err(domain_sql)?,
+        preset_id: PresetId::new(preset_id).map_err(domain_sql)?,
+        config: serde_json::from_str(&definition).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        created_at: text_timestamp(created_at).map_err(store_sql)?,
+        updated_at: text_timestamp(updated_at).map_err(store_sql)?,
+    })
+}
+
+fn active_preset_rules(
+    tx: &Transaction<'_>,
+    preset_id: &PresetId,
+) -> std::result::Result<Vec<PresetRule>, StoreError> {
+    let state: Option<String> = tx
+        .query_row(
+            "SELECT state FROM preset WHERE id=?",
+            [preset_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_error)?;
+    match state.as_deref() {
+        Some("active") => {}
+        Some("archived") => return Err(store_error("preset is archived")),
+        _ => return Err(store_error("preset was not found")),
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT id,preset_id,definition,created_at,updated_at FROM preset_rule WHERE preset_id=? ORDER BY created_at,kind",
+        )
+        .map_err(store_error)?;
+    let rules = statement
+        .query_map([preset_id.as_str()], read_preset_rule)
+        .map_err(store_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(store_error)?;
+    for rule in &rules {
+        rule.config.validate().map_err(store_error)?;
+    }
+    Ok(rules)
+}
+
+fn insert_runtime_rule(
+    tx: &Transaction<'_>,
+    watch_id: &WatchId,
+    config: &RuleConfig,
+    at: &Timestamp,
+) -> std::result::Result<Rule, StoreError> {
+    let id = RuleId::new(uid("rule")).map_err(store_error)?;
+    let timestamp = sql_timestamp(at);
+    tx.execute(
+        "INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)",
+        params![id.as_str(), watch_id.as_str(), rule_kind_text(config.kind()), true, timestamp, timestamp],
+    )
+    .map_err(store_error)?;
+    tx.execute(
+        "INSERT INTO rule_definition(rule_id,version,encoding_version,definition,created_at) VALUES (?,1,1,?,?)",
+        params![id.as_str(), serde_json::to_string(config).map_err(store_error)?, sql_timestamp(at)],
+    )
+    .map_err(store_error)?;
+    tx.query_row(
+        "SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=?",
+        [id.as_str()],
+        read_rule,
+    )
+    .map_err(store_error)
+}
+
+#[async_trait]
+impl PresetRepository for SqliteStore {
+    async fn add_preset(&self, draft: NewPreset) -> std::result::Result<Preset, StoreError> {
+        if draft.name.trim().is_empty() {
+            return Err(store_error("preset name must not be empty"));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let id = PresetId::new(uid("preset")).map_err(store_error)?;
+        let at = sql_timestamp(&draft.created_at);
+        tx.execute(
+            "INSERT INTO preset(id,name,description,state,created_at,updated_at) VALUES (?,?,?,'active',?,?)",
+            params![id.as_str(), draft.name, draft.description, at, at],
+        )
+        .map_err(store_error)?;
+        let preset = tx
+            .query_row(
+                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                [id.as_str()],
+                read_preset,
+            )
+            .map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(preset)
+    }
+
+    async fn list_presets(
+        &self,
+        include_archived: bool,
+    ) -> std::result::Result<Vec<Preset>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let mut statement = connection.prepare("SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE (?1 OR state='active') ORDER BY created_at,id").map_err(store_error)?;
+        let presets = statement
+            .query_map([include_archived], read_preset)
+            .map_err(store_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(store_error)?;
+        Ok(presets)
+    }
+
+    async fn get_preset(&self, id: PresetId) -> std::result::Result<Option<Preset>, StoreError> {
+        self.connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?
+            .query_row(
+                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                [id.as_str()],
+                read_preset,
+            )
+            .optional()
+            .map_err(store_error)
+    }
+
+    async fn rename_preset(
+        &self,
+        id: PresetId,
+        name: String,
+        at: Timestamp,
+    ) -> std::result::Result<Preset, StoreError> {
+        if name.trim().is_empty() {
+            return Err(store_error("preset name must not be empty"));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection.transaction().map_err(store_error)?;
+        if tx
+            .execute(
+                "UPDATE preset SET name=?,updated_at=? WHERE id=? AND state='active'",
+                params![name, sql_timestamp(&at), id.as_str()],
+            )
+            .map_err(store_error)?
+            == 0
+        {
+            return Err(store_error("preset was not found or is archived"));
+        }
+        let preset = tx
+            .query_row(
+                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                [id.as_str()],
+                read_preset,
+            )
+            .map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(preset)
+    }
+
+    async fn archive_preset(
+        &self,
+        id: PresetId,
+        at: Timestamp,
+    ) -> std::result::Result<Preset, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection.transaction().map_err(store_error)?;
+        let timestamp = sql_timestamp(&at);
+        if tx.execute("UPDATE preset SET state='archived',updated_at=?,archived_at=? WHERE id=? AND state='active'", params![timestamp, timestamp, id.as_str()]).map_err(store_error)? == 0 {
+            return Err(store_error("preset was not found or is archived"));
+        }
+        let preset = tx
+            .query_row(
+                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                [id.as_str()],
+                read_preset,
+            )
+            .map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(preset)
+    }
+
+    async fn add_preset_rule(
+        &self,
+        preset_id: PresetId,
+        config: RuleConfig,
+        at: Timestamp,
+    ) -> std::result::Result<PresetRule, StoreError> {
+        config.validate().map_err(store_error)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        active_preset_rules(&tx, &preset_id)?;
+        let timestamp = sql_timestamp(&at);
+        let id = PresetRuleId::new(uid("preset_rule")).map_err(store_error)?;
+        tx.execute("INSERT INTO preset_rule(id,preset_id,kind,definition,created_at,updated_at) VALUES (?,?,?,?,?,?)", params![id.as_str(), preset_id.as_str(), rule_kind_text(config.kind()), serde_json::to_string(&config).map_err(store_error)?, timestamp, timestamp]).map_err(store_error)?;
+        let rule = tx
+            .query_row(
+                "SELECT id,preset_id,definition,created_at,updated_at FROM preset_rule WHERE id=?",
+                [id.as_str()],
+                read_preset_rule,
+            )
+            .map_err(store_error)?;
+        tx.execute(
+            "UPDATE preset SET updated_at=? WHERE id=?",
+            params![sql_timestamp(&at), preset_id.as_str()],
+        )
+        .map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(rule)
+    }
+
+    async fn update_preset_rule(
+        &self,
+        change: PresetRuleChange,
+    ) -> std::result::Result<PresetRule, StoreError> {
+        change.config.validate().map_err(store_error)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection.transaction().map_err(store_error)?;
+        let (preset_id, kind): (String, String) = tx
+            .query_row(
+                "SELECT preset_id,kind FROM preset_rule WHERE id=?",
+                [change.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_error)?
+            .ok_or_else(|| store_error("preset rule was not found"))?;
+        let preset_id = PresetId::new(preset_id).map_err(store_error)?;
+        if parse_rule_kind(kind).map_err(store_error)? != change.config.kind() {
+            return Err(store_error("preset rule kind cannot change"));
+        }
+        active_preset_rules(&tx, &preset_id)?;
+        if tx
+            .execute(
+                "UPDATE preset_rule SET definition=?,updated_at=? WHERE id=?",
+                params![
+                    serde_json::to_string(&change.config).map_err(store_error)?,
+                    sql_timestamp(&change.at),
+                    change.id.as_str()
+                ],
+            )
+            .map_err(store_error)?
+            == 0
+        {
+            return Err(store_error("preset rule was not found"));
+        }
+        let rule = tx
+            .query_row(
+                "SELECT id,preset_id,definition,created_at,updated_at FROM preset_rule WHERE id=?",
+                [change.id.as_str()],
+                read_preset_rule,
+            )
+            .map_err(store_error)?;
+        tx.execute(
+            "UPDATE preset SET updated_at=? WHERE id=?",
+            params![sql_timestamp(&change.at), preset_id.as_str()],
+        )
+        .map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(rule)
+    }
+
+    async fn remove_preset_rule(
+        &self,
+        id: PresetRuleId,
+        at: Timestamp,
+    ) -> std::result::Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection.transaction().map_err(store_error)?;
+        let preset_id: String = tx
+            .query_row(
+                "SELECT preset_id FROM preset_rule WHERE id=?",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_error)?
+            .ok_or_else(|| store_error("preset rule was not found"))?;
+        let preset_id = PresetId::new(preset_id).map_err(store_error)?;
+        active_preset_rules(&tx, &preset_id)?;
+        if tx
+            .execute("DELETE FROM preset_rule WHERE id=?", [id.as_str()])
+            .map_err(store_error)?
+            == 0
+        {
+            return Err(store_error("preset rule was not found"));
+        }
+        tx.execute(
+            "UPDATE preset SET updated_at=? WHERE id=?",
+            params![sql_timestamp(&at), preset_id.as_str()],
+        )
+        .map_err(store_error)?;
+        tx.commit().map_err(store_error)
+    }
+
+    async fn list_preset_rules(
+        &self,
+        preset_id: PresetId,
+    ) -> std::result::Result<Vec<PresetRule>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let mut statement = connection.prepare("SELECT id,preset_id,definition,created_at,updated_at FROM preset_rule WHERE preset_id=? ORDER BY created_at,kind").map_err(store_error)?;
+        let rules = statement
+            .query_map([preset_id.as_str()], read_preset_rule)
+            .map_err(store_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(store_error)?;
+        Ok(rules)
+    }
+
+    async fn add_watch_from_preset(
+        &self,
+        preset_id: PresetId,
+        draft: NewWatch,
+    ) -> std::result::Result<Watch, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let preset_rules = active_preset_rules(&tx, &preset_id)?;
+        if let Some((id, state)) = tx.query_row("SELECT w.id,w.state FROM subject s JOIN watch w ON w.subject_id=s.id WHERE s.subject_key=? ORDER BY w.created_at DESC LIMIT 1", [draft.subject.key.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional().map_err(store_error)? {
+            return Err(store_error(if state == "paused" {
+                format!("watch {id} is paused; run airborne watch resume {id}")
+            } else if state == "archived" {
+                format!("watch {id} is archived; archived history prevents re-adding this subject")
+            } else {
+                format!("watch {id} already exists and is active")
+            }));
+        }
+        let at = sql_timestamp(&draft.subject.created_at);
+        tx.execute("INSERT INTO subject(subject_key,kind,canonical_url,title,revision,metadata_refreshed_at,created_at,updated_at) VALUES (?1,'github_pull_request',?2,?3,?4,?5,?6,?6)", params![draft.subject.key.as_str(), draft.subject.canonical_url, draft.subject.display_title, draft.subject.current_revision.as_ref().map(|value| value.as_str()), draft.subject.metadata_refreshed_at.as_ref().map(sql_timestamp), at]).map_err(store_error)?;
+        let subject_id: i64 = tx
+            .query_row(
+                "SELECT id FROM subject WHERE subject_key=?",
+                [draft.subject.key.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(store_error)?;
+        let id = WatchId::new(uid("watch")).map_err(store_error)?;
+        tx.execute("INSERT INTO watch(id,subject_id,state,created_at,updated_at,archived_at) VALUES (?,?,?,?,?,?)", params![id.as_str(), subject_id, watch_state_text(draft.state), sql_timestamp(&draft.subject.created_at), sql_timestamp(&draft.subject.created_at), if draft.state == WatchState::Archived { Some(sql_timestamp(&draft.subject.created_at)) } else { None }]).map_err(store_error)?;
+        for preset_rule in &preset_rules {
+            insert_runtime_rule(&tx, &id, &preset_rule.config, &draft.subject.created_at)?;
+        }
+        let watch = tx.query_row("SELECT w.id,s.subject_key,w.state,w.created_at,w.updated_at,w.archived_at FROM watch w JOIN subject s ON s.id=w.subject_id WHERE w.id=?", [id.as_str()], read_watch).map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(watch)
+    }
+
+    async fn apply_preset(
+        &self,
+        preset_id: PresetId,
+        watch_id: WatchId,
+        replace: bool,
+        at: Timestamp,
+    ) -> std::result::Result<Vec<Rule>, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| store_error("database lock failed"))?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let preset_rules = active_preset_rules(&tx, &preset_id)?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM watch WHERE id=?",
+                [watch_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_error)?;
+        match state.as_deref() {
+            Some("archived") => return Err(store_error("watch is archived")),
+            Some(_) => {}
+            None => return Err(store_error("watch was not found")),
+        }
+        let mut conflicts = Vec::new();
+        for preset_rule in &preset_rules {
+            if let Some(existing) = existing_live_rule(&tx, &watch_id, preset_rule.config.kind())? {
+                conflicts.push(existing);
+            }
+        }
+        if !replace {
+            if let Some(existing_rule_id) = conflicts.into_iter().next() {
+                let kind = tx
+                    .query_row(
+                        "SELECT kind FROM rule WHERE id=?",
+                        [existing_rule_id.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(store_error)?;
+                return Err(StoreError::RuleKindConflict {
+                    watch_id,
+                    kind: parse_rule_kind(kind).map_err(store_error)?,
+                    existing_rule_id,
+                });
+            }
+        }
+        if replace {
+            for preset_rule in &preset_rules {
+                tx.execute("UPDATE rule SET state='archived',enabled=0,updated_at=?,archived_at=? WHERE watch_id=? AND kind=? AND state='active'", params![sql_timestamp(&at), sql_timestamp(&at), watch_id.as_str(), rule_kind_text(preset_rule.config.kind())]).map_err(store_error)?;
+            }
+        }
+        let mut rules = Vec::with_capacity(preset_rules.len());
+        for preset_rule in &preset_rules {
+            rules.push(insert_runtime_rule(
+                &tx,
+                &watch_id,
+                &preset_rule.config,
+                &at,
+            )?);
+        }
+        tx.commit().map_err(store_error)?;
+        Ok(rules)
+    }
+}
+
 #[async_trait]
 impl CatalogRepository for SqliteStore {
     async fn add_watch(&self, draft: NewWatch) -> std::result::Result<Watch, StoreError> {
@@ -1757,10 +2332,10 @@ impl CatalogRepository for SqliteStore {
                 return Err(store_error(format!(
                     "watch {} was not found",
                     draft.watch_id
-                )))
+                )));
             }
             Some("archived") => {
-                return Err(store_error(format!("watch {} is archived", draft.watch_id)))
+                return Err(store_error(format!("watch {} is archived", draft.watch_id)));
             }
             _ => {}
         }
@@ -2192,11 +2767,23 @@ impl AlertRepository for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at() -> Timestamp {
+        Timestamp::parse("2026-01-01T00:00:00Z").unwrap()
+    }
+
+    fn check(name: &str) -> RuleConfig {
+        RuleConfig::GitHubCheckCompletes {
+            check_name: name.into(),
+            alert_on_start: false,
+            alert_if_missing_after_seconds: None,
+        }
+    }
     #[test]
     fn makes_all_logical_tables_and_reopens() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         store.integrity_check().unwrap();
         drop(store);
         assert_eq!(
@@ -2204,7 +2791,249 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            6
+            7
+        );
+    }
+    #[test]
+    fn v7_migration_adds_preset_tables_without_touching_runtime_history() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::open(file.path()).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); DROP TABLE preset_rule; DROP TABLE preset; DELETE FROM schema_migration WHERE version=7;").unwrap();
+        }
+        drop(store);
+        let store = SqliteStore::open(file.path()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 7);
+        let connection = store.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM watch", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(connection
+            .query_row("SELECT count(*) FROM preset", [], |row| row
+                .get::<_, i64>(0))
+            .is_ok());
+    }
+    #[tokio::test]
+    async fn presets_archive_without_releasing_their_names() {
+        let store = SqliteStore::memory().unwrap();
+        let preset = store
+            .add_preset(NewPreset {
+                name: "CI".into(),
+                description: Some("shared checks".into()),
+                created_at: at(),
+            })
+            .await
+            .unwrap();
+        let rule = store
+            .add_preset_rule(preset.id.clone(), check("old"), at())
+            .await
+            .unwrap();
+        assert_eq!(rule.config, check("old"));
+        let changed = store
+            .update_preset_rule(PresetRuleChange {
+                id: rule.id.clone(),
+                config: check("new"),
+                at: Timestamp::parse("2026-01-02T00:00:00Z").unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(changed.config, check("new"));
+        assert!(changed.id.as_str().starts_with("preset_rule-"));
+        assert_eq!(
+            store
+                .get_preset(preset.id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .updated_at,
+            Timestamp::parse("2026-01-02T00:00:00Z").unwrap()
+        );
+        store
+            .remove_preset_rule(
+                changed.id,
+                Timestamp::parse("2026-01-03T00:00:00Z").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_preset(preset.id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .updated_at,
+            Timestamp::parse("2026-01-03T00:00:00Z").unwrap()
+        );
+        assert!(store
+            .list_preset_rules(preset.id.clone())
+            .await
+            .unwrap()
+            .is_empty());
+        store
+            .add_preset_rule(preset.id.clone(), check("new"), at())
+            .await
+            .unwrap();
+        store
+            .archive_preset(
+                preset.id.clone(),
+                Timestamp::parse("2026-01-04T00:00:00Z").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .add_preset(NewPreset {
+                name: "CI".into(),
+                description: None,
+                created_at: at()
+            })
+            .await
+            .is_err());
+        assert!(store.list_presets(false).await.unwrap().is_empty());
+        let archived = store.list_presets(true).await.unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].description.as_deref(), Some("shared checks"));
+        assert_eq!(store.list_preset_rules(preset.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn applying_a_preset_preflights_and_archives_only_with_replace() {
+        let store = SqliteStore::memory().unwrap();
+        let preset = store
+            .add_preset(NewPreset {
+                name: "CI".into(),
+                description: None,
+                created_at: at(),
+            })
+            .await
+            .unwrap();
+        store
+            .add_preset_rule(preset.id.clone(), check("new"), at())
+            .await
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('old','w','github_check_completes',0,2,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO rule_definition VALUES ('old',1,1,'{\"kind\":\"git_hub_check_completes\",\"check_name\":\"first\"}','2026-01-01T00:00:00Z'); INSERT INTO rule_definition VALUES ('old',2,1,'{\"kind\":\"git_hub_check_completes\",\"check_name\":\"old\"}','2026-01-01T00:00:00Z');").unwrap();
+        }
+        let watch_id = WatchId::new("w").unwrap();
+        assert!(matches!(
+            store
+                .apply_preset(preset.id.clone(), watch_id.clone(), false, at())
+                .await,
+            Err(StoreError::RuleKindConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .get_rule(&RuleId::new("old").unwrap())
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            None
+        );
+        let rules = store
+            .apply_preset(preset.id, watch_id, true, at())
+            .await
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].enabled);
+        assert_eq!(rules[0].current_version, RuleVersion::new(1).unwrap());
+        assert!(store
+            .get_rule(&RuleId::new("old").unwrap())
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+        let connection = store.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM rule_definition WHERE rule_id='old'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+    }
+    #[tokio::test]
+    async fn adding_a_watch_from_a_preset_creates_fresh_enabled_rules() {
+        let store = SqliteStore::memory().unwrap();
+        let preset = store
+            .add_preset(NewPreset {
+                name: "CI".into(),
+                description: None,
+                created_at: at(),
+            })
+            .await
+            .unwrap();
+        store
+            .add_preset_rule(preset.id.clone(), check("ci"), at())
+            .await
+            .unwrap();
+        let watch = store
+            .add_watch_from_preset(
+                preset.id,
+                NewWatch {
+                    subject: Subject {
+                        key: SubjectKey::new("github.com/acme/app/pull/1").unwrap(),
+                        kind: airborne_core::SubjectKind::GitHubPullRequest,
+                        canonical_url: "https://github.com/acme/app/pull/1".into(),
+                        display_title: "PR 1".into(),
+                        current_revision: None,
+                        metadata_refreshed_at: None,
+                        created_at: at(),
+                    },
+                    state: WatchState::Active,
+                },
+            )
+            .await
+            .unwrap();
+        let rules = store.list_rules(Some(&watch.id)).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].enabled);
+        assert_eq!(rules[0].current_version, RuleVersion::new(1).unwrap());
+    }
+    #[tokio::test]
+    async fn adding_a_watch_from_a_preset_keeps_paused_watch_guidance() {
+        let store = SqliteStore::memory().unwrap();
+        let preset = store
+            .add_preset(NewPreset {
+                name: "CI".into(),
+                description: None,
+                created_at: at(),
+            })
+            .await
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('github.com/acme/app/pull/1','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('paused-watch',1,'paused','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');")
+            .unwrap();
+        let error = store
+            .add_watch_from_preset(
+                preset.id,
+                NewWatch {
+                    subject: Subject {
+                        key: SubjectKey::new("github.com/acme/app/pull/1").unwrap(),
+                        kind: airborne_core::SubjectKind::GitHubPullRequest,
+                        canonical_url: "https://github.com/acme/app/pull/1".into(),
+                        display_title: "PR 1".into(),
+                        current_revision: None,
+                        metadata_refreshed_at: None,
+                        created_at: at(),
+                    },
+                    state: WatchState::Active,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "watch paused-watch is paused; run airborne watch resume paused-watch"
         );
     }
     #[test]
@@ -2638,7 +3467,7 @@ mod tests {
         for version in [1, 2, 3] {
             let file = legacy_database_with_alert(version);
             let store = SqliteStore::open(file.path()).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 6);
+            assert_eq!(store.schema_version().unwrap(), 7);
             let c = store.connection.lock().unwrap();
             assert_eq!(
                 c.query_row("SELECT watch_id FROM alert", [], |r| r.get::<_, String>(0))
@@ -2671,7 +3500,7 @@ mod tests {
         c.execute_batch("CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT); INSERT INTO schema_migration VALUES(4,'x'); CREATE TABLE subject(id INTEGER PRIMARY KEY,subject_key TEXT); CREATE TABLE watch(id TEXT PRIMARY KEY,subject_id INTEGER); CREATE TABLE rule(id TEXT PRIMARY KEY,watch_id TEXT,kind TEXT,enabled INTEGER,current_version INTEGER,state TEXT,created_at TEXT,updated_at TEXT,archived_at TEXT); CREATE TABLE rule_definition(rule_id TEXT,version INTEGER,encoding_version INTEGER,definition TEXT,created_at TEXT,PRIMARY KEY(rule_id,version)); CREATE TABLE observation(id INTEGER PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,state TEXT,source_identity TEXT,source_url TEXT,detail TEXT,observed_at TEXT); CREATE TABLE alert(id TEXT PRIMARY KEY,rule_id TEXT,rule_version INTEGER,watch_id TEXT,subject_key TEXT,rule_kind TEXT,revision TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT,source_url TEXT,created_at TEXT,acknowledged_at TEXT); INSERT INTO subject VALUES(1,'s'); INSERT INTO watch VALUES('w',1); INSERT INTO rule VALUES('first','w','github_check_completes',1,1,'active','2026-01-01T00:00:00Z','x',NULL),('later','w','github_check_completes',1,1,'active','2026-01-02T00:00:00Z','x',NULL); INSERT INTO rule_definition VALUES('first',1,1,'{}','x'),('later',1,1,'{}','x'); INSERT INTO observation VALUES(1,'first',1,'v','completed','source',NULL,NULL,'2026-01-03T00:00:00Z'); INSERT INTO alert VALUES('a','first',1,'w','s','github_check_completes','v','source','t','b','pending',NULL,'x',NULL);").unwrap();
         drop(c);
         let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         let c = store.connection.lock().unwrap();
         assert_eq!(
             c.query_row("SELECT event_kind FROM alert", [], |r| r

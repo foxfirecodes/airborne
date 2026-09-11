@@ -34,16 +34,32 @@ airborne watch add https://github.com/OWNER/REPO/pull/123
 `watch add` prints a watch ID. Use it to choose what Airborne should track:
 
 ```sh
-airborne rule add bugbot WATCH_ID
+airborne rule add bugbot --watch WATCH_ID
 airborne refresh
 airborne alerts list --pending
+```
+
+To reuse the same rules across pull requests, save them as a preset. Adding a
+watch from a preset copies its rules into that watch:
+
+```sh
+airborne preset add standard --description 'Checks we use on every pull request'
+airborne rule add bugbot --preset standard
+airborne watch add https://github.com/OWNER/REPO/pull/123 --preset standard
+```
+
+The copy is not a live link. Later changes to `standard` affect only watches
+that use it in the future. To copy it to an existing watch, use:
+
+```sh
+airborne rule apply --preset standard --watch WATCH_ID
 ```
 
 To watch a Buildkite job, save a Buildkite token and add a job rule:
 
 ```sh
 airborne auth set buildkite
-airborne rule add buildkite-job WATCH_ID \
+airborne rule add buildkite-job --watch WATCH_ID \
   --context 'buildkite/your-pipeline' \
   --organization your-organization \
   --pipeline your-pipeline \
@@ -59,10 +75,9 @@ options.
 ```bash
 # watch for bugbot status on the PR
 airborne watch add https://github.com/OWNER/REPO/pull/123
-airborne rule add bugbot \
+airborne rule add bugbot --watch https://github.com/OWNER/REPO/pull/123 \
   --alert-on-start \
   --alert-if-missing-after 3m \
-  https://github.com/OWNER/REPO/pull/123
 
 # shell A: run the poller
 airborne run | tee /tmp/airborne.log

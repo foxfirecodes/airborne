@@ -106,7 +106,7 @@ errors must not call it `PR Watcher`.
 ### 3.3 Watch commands
 
 ```text
-airborne watch add <GITHUB_PR_URL> [--paused]
+airborne watch add <GITHUB_PR_URL> [--preset <PRESET_ID_OR_NAME>] [--paused]
 airborne watch list [--active|--all]
 airborne watch show <WATCH_ID_OR_GITHUB_PR_URL>
 airborne watch pause <WATCH_ID>
@@ -118,8 +118,9 @@ airborne watch remove <WATCH_ID_OR_GITHUB_PR_URL> [--yes]
 - `watch list` must show each canonical pull request URL. `watch show` and
   `watch remove` must accept that URL as the natural watch identifier while
   retaining watch ID support for compatibility.
-- It must fetch and store the PR title and current head revision before it
-  commits the watch.
+- It must fetch the PR title and current head revision before it commits the
+  watch. When `--preset` is supplied, it must create the watch and copy every
+  preset rule atomically. Version 1 accepts one preset per `watch add`.
 - Adding the same active or archived subject must fail with a useful message.
   The message must point to the existing watch and, when needed, `resume`.
 - `watch remove` must archive the watch and its active rules. It must retain
@@ -130,15 +131,32 @@ airborne watch remove <WATCH_ID_OR_GITHUB_PR_URL> [--yes]
 - Destructive prompts must work only on an interactive terminal. Scripts must
   pass `--yes`.
 
-### 3.4 Rule commands
+### 3.4 Preset commands
 
 ```text
-airborne rule add bugbot <WATCH_ID_OR_GITHUB_PR_URL> [--check-name <NAME>] \
+airborne preset add <NAME> [--description <DESCRIPTION>]
+airborne preset list [--all]
+airborne preset show <PRESET_ID_OR_NAME>
+airborne preset rename <PRESET_ID_OR_NAME> <NEW_NAME>
+airborne preset remove <PRESET_ID_OR_NAME> [--yes]
+```
+
+A preset holds reusable rule definitions, not running rules. It has no watch,
+enabled state, versions, observations, or alerts. It may have a description.
+Preset names stay unique, including names held by archived presets. `preset
+remove` archives the preset and does not free its name. `preset show` includes
+its rule definitions; `preset list` omits archived presets unless `--all` is
+supplied.
+
+### 3.5 Rule commands
+
+```text
+airborne rule add bugbot (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) [--check-name <NAME>] \
   [--replace] \
   [--alert-on-start] \
   [--alert-if-missing-after <DURATION>]
 
-airborne rule add buildkite-job <WATCH_ID_OR_GITHUB_PR_URL> \
+airborne rule add buildkite-job (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) \
   --context <GITHUB_STATUS_CONTEXT> \
   --organization <ORGANIZATION> \
   --pipeline <PIPELINE> \
@@ -146,20 +164,38 @@ airborne rule add buildkite-job <WATCH_ID_OR_GITHUB_PR_URL> \
   [--replace] \
   [--notify-on terminal|passed]
 
-airborne rule list [--watch <WATCH_ID_OR_GITHUB_PR_URL>] [--enabled|--all]
-airborne rule show <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>]
+airborne rule list [--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>] [--enabled|--all]
+airborne rule show <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>]
 airborne rule enable <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>]
 airborne rule disable <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>]
-airborne rule update <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>] [KIND-SPECIFIC OPTIONS] \
+airborne rule update <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>] [KIND-SPECIFIC OPTIONS] \
   [--alert-on-start|--no-alert-on-start] \
   [--alert-if-missing-after <DURATION>|--no-alert-if-missing-after]
-airborne rule remove <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL>] [--yes]
+airborne rule remove <RULE_ID_OR_NAME> [--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>] [--yes]
+airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_URL> [--replace]
 ```
 
 - The default Bugbot check name must be `Cursor Bugbot`.
 - `rule add --replace` must archive the current non-archived rule of the same
   kind and create the requested rule in one transaction. With no current rule,
   it must act like a normal add. Past alerts and observations must remain.
+  For a preset target, `--replace` instead replaces that preset definition;
+  presets have no rule history to archive.
+- Every `rule add` target is exactly one of `--watch` and `--preset`. A watch
+  rule is enabled at creation and begins at version `1`; a preset rule is only
+  a reusable definition. `rule enable` and `rule disable` accept watch targets
+  only.
+- `rule list`, `show`, `update`, and `remove` may target either a watch or a
+  preset. A rule name that is ambiguous within its selected target must fail.
+  Removing a preset rule removes that definition; removing a watch rule
+  archives it.
+- `rule apply` copies every preset rule into the named watch in one transaction.
+  Without `--replace`, any occupied same-kind slot is a conflict and no rules
+  are copied. With `--replace`, it archives each conflicting watch rule and
+  creates enabled replacement rules at version `1`, all in that transaction.
+  Archived rules retain their alerts and observations.
+- A copied rule has no ongoing relationship with its preset. Preset mutations
+  affect only future `watch add --preset` and `rule apply` copies.
 - Rule commands must accept a full rule ID or a stable human name. `bugbot`
   identifies the GitHub check rule on a watch. An exact GitHub check name,
   Buildkite status context, or Buildkite job name also identifies its rule.
@@ -190,7 +226,7 @@ The CLI does not require a separate pipeline-mapping record. A Buildkite rule
 contains the full expected context and pipeline identity. This removes a UI
 picker concern from the domain model.
 
-### 3.5 Refresh and run
+### 3.6 Refresh and run
 
 ```text
 airborne refresh [WATCH_ID] [--wait <DURATION>]
@@ -218,7 +254,7 @@ airborne run [--interval <DURATION>]
 - A canceled refresh must not commit a half-applied subject result.
 - Each cycle must emit its report before sleeping.
 
-### 3.6 Status and alerts
+### 3.7 Status and alerts
 
 ```text
 airborne status [--watch <WATCH_ID>]
@@ -241,7 +277,7 @@ airborne alerts acknowledge --all [--yes]
   field exposed by version 1.
 - Opening or listing an alert must not acknowledge it.
 
-### 3.7 Authentication and configuration
+### 3.8 Authentication and configuration
 
 ```text
 airborne auth set github

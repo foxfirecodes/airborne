@@ -95,6 +95,8 @@ macro_rules! string_value {
 
 string_value!(WatchId, "watch ID");
 string_value!(RuleId, "rule ID");
+string_value!(PresetId, "preset ID");
+string_value!(PresetRuleId, "preset rule ID");
 string_value!(AlertId, "alert ID");
 string_value!(PollAttemptId, "poll attempt ID");
 string_value!(RefreshId, "refresh ID");
@@ -357,6 +359,28 @@ pub struct RuleDefinition {
     pub version: RuleVersion,
     pub config: RuleConfig,
     pub created_at: Timestamp,
+}
+
+/// A named, reusable set of rule definitions. Presets have no runtime state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preset {
+    pub id: PresetId,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub archived_at: Option<Timestamp>,
+}
+
+/// A rule definition stored in a preset. Unlike [`Rule`], it has no enabled
+/// flag or version because neither belongs to a reusable definition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetRule {
+    pub id: PresetRuleId,
+    pub preset_id: PresetId,
+    pub config: RuleConfig,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RuleKey {

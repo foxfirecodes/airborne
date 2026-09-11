@@ -14,6 +14,8 @@ payload names stay inside provider components unless this document adopts them.
 | **Subject key** | A stable identity for a subject, such as GitHub host, owner, repository, and pull request number. |
 | **Revision** | The version of a subject against which rules run. For a pull request, this is the full head commit SHA. |
 | **Watch** | The user's local choice to monitor one subject. A watch may be active, paused, or archived. |
+| **Preset** | A named, reusable set of rule definitions with no watch or runtime state. |
+| **Preset rule** | A typed rule definition held by a preset. |
 | **Rule** | A typed condition attached to one watch. |
 | **Rule version** | A positive number that changes when matching or alert policy changes, or when a rule is re-enabled. |
 | **Fetch plan** | The smallest set of provider calls needed to evaluate the enabled rules for one subject. |
@@ -45,6 +47,8 @@ at component boundaries:
 ```text
 WatchId
 RuleId
+PresetId
+PresetRuleId
 RuleVersion
 AlertId
 PollAttemptId
@@ -111,7 +115,38 @@ disable and enable when the same behavior is needed for one rule.
 Archiving a watch archives its rules. It does not delete its subject, history,
 or alerts.
 
-### 4.3 Rule and rule version
+### 4.3 Preset and preset rule
+
+```text
+Preset
+  id
+  name
+  description?
+  created_at
+  updated_at
+  archived_at?
+
+PresetRule
+  id
+  preset_id
+  config
+  created_at
+  updated_at
+```
+
+A preset is a reusable rule template, not a watch. Its rules have no enabled
+flag, version, observations, alerts, or lifecycle state. A preset may have at
+most one rule of each kind.
+
+Adding a watch with a preset copies every preset rule into new, enabled watch
+rules at version `1`, in the same transaction as the watch. Applying a preset
+to an existing watch does the same. The copy is not a live link: changing,
+renaming, or archiving a preset never changes rules already copied from it.
+
+Preset names are unique for their whole history. Removing a preset archives it
+and retains its name; no later preset may use that name.
+
+### 4.4 Rule and rule version
 
 ```text
 Rule
@@ -159,7 +194,7 @@ BuildkiteJobCompletes
 
 The provider-neutral state is not stored in the rule definition.
 
-### 4.4 Candidate
+### 4.5 Candidate
 
 ```text
 Candidate
@@ -212,7 +247,7 @@ may therefore carry `terminal` when `notify_on` is `terminal`. A source first
 seen terminal carries only `terminal`, never `started`. Reconciliation gates
 the intent against durable lifecycle history and alert-key deduplication.
 
-### 4.5 Observation
+### 4.6 Observation
 
 ```text
 Observation
@@ -232,7 +267,7 @@ revisions remain available for lifecycle decisions and diagnosis.
 
 Source issues never overwrite an observation.
 
-### 4.6 Alert
+### 4.7 Alert
 
 ```text
 Alert
@@ -258,7 +293,7 @@ immutable. Only `acknowledged_at` may change.
 An alert with no acknowledgement is pending. Acknowledgement does not alter an
 observation or prevent a later alert with a different key.
 
-### 4.7 Revision lifecycle
+### 4.8 Revision lifecycle
 
 ```text
 RevisionLifecycle
@@ -275,7 +310,7 @@ results must not reset it. Any candidate with a source identity sets
 `source_seen` permanently. Reconciliation reads and updates this record in the
 same transaction as its observation and alerts.
 
-### 4.8 Poll attempt and source issue
+### 4.9 Poll attempt and source issue
 
 ```text
 PollAttempt

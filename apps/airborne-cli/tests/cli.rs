@@ -17,8 +17,103 @@ fn root_help_has_the_production_command_groups() {
             "Watch pull requests and report when important checks finish",
         ))
         .stdout(predicate::str::contains("watch"))
+        .stdout(predicate::str::contains("preset"))
         .stdout(predicate::str::contains("refresh"))
         .stdout(predicate::str::contains("migrate"));
+}
+
+#[test]
+fn preset_commands_and_selectors_are_exposed_in_help() {
+    airborne()
+        .args(["preset", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("rename"))
+        .stdout(predicate::str::contains("remove"));
+    airborne()
+        .args(["preset", "add", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<NAME>"))
+        .stdout(predicate::str::contains("--description <DESCRIPTION>"));
+    airborne()
+        .args(["watch", "add", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--preset"))
+        .stdout(predicate::str::contains("GITHUB_PR_URL"))
+        .stdout(predicate::str::contains("Create the watch paused"));
+    airborne()
+        .args(["rule", "apply", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--preset"))
+        .stdout(predicate::str::contains("--watch"))
+        .stdout(predicate::str::contains("--replace"));
+    airborne()
+        .args(["rule", "add", "bugbot", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "(--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>)",
+        ));
+}
+
+#[test]
+fn rule_add_requires_exactly_one_scope_selector() {
+    airborne()
+        .args(["rule", "add", "bugbot"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--watch <WATCH_ID_OR_GITHUB_PR_URL>",
+        ));
+    airborne()
+        .args([
+            "rule", "add", "bugbot", "--watch", "watch-1", "--preset", "preset-1",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn preset_rule_lists_reject_runtime_state_filters() {
+    let dir = TempDir::new().expect("temp directory");
+    for filter in ["--enabled", "--all"] {
+        airborne()
+            .args(["--data-dir"])
+            .arg(dir.path())
+            .args(["rule", "list", "--preset", "missing", filter])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "preset rules have no runtime state",
+            ));
+    }
+}
+
+#[test]
+fn preset_add_accepts_a_description() {
+    let dir = TempDir::new().expect("temp directory");
+    airborne()
+        .args(["--json", "--data-dir"])
+        .arg(dir.path())
+        .args([
+            "preset",
+            "add",
+            "standard",
+            "--description",
+            "Default CI checks",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"description\":\"Default CI checks\"",
+        ));
 }
 
 #[test]

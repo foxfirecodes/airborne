@@ -257,7 +257,7 @@ fn root_and_group_help_command_snapshots_are_stable() {
     for (args, expected) in [
         (
             vec!["--help"],
-            "Watch pull requests and report when important checks finish\n\nUsage: airborne [OPTIONS] <COMMAND>\n\nCommands:\n  watch    Manage watched pull requests\n  rule     Manage rules for watched pull requests\n  refresh  Check active watches once, then exit\n  run      Poll active watches in the foreground\n  status   Show watches, rules, and their latest state\n  alerts   List and acknowledge alerts\n  auth     Configure GitHub and Buildkite access\n  config   View and change local settings\n  doctor   Check credentials, storage, and provider access\n  migrate  Import data from the desktop prototype\n  help     Print this message or the help of the given subcommand(s)",
+            "Watch pull requests and report when important checks finish\n\nUsage: airborne [OPTIONS] <COMMAND>\n\nCommands:\n  watch    Manage watched pull requests\n  rule     Manage rules for watched pull requests\n  preset   Manage reusable rule presets\n  refresh  Check active watches once, then exit\n  run      Poll active watches in the foreground\n  status   Show watches, rules, and their latest state\n  alerts   List and acknowledge alerts\n  auth     Configure GitHub and Buildkite access\n  config   View and change local settings\n  doctor   Check credentials, storage, and provider access\n  migrate  Import data from the desktop prototype\n  help     Print this message or the help of the given subcommand(s)",
         ),
         (
             vec!["watch", "--help"],
@@ -265,7 +265,7 @@ fn root_and_group_help_command_snapshots_are_stable() {
         ),
         (
             vec!["rule", "--help"],
-            "Manage rules for watched pull requests\n\nUsage: airborne rule [OPTIONS] <COMMAND>\n\nCommands:\n  add      Add a rule\n  list     List rules, optionally for one watch\n  show     Show a rule and its current version\n  enable   Enable a rule and reset its baseline\n  disable  Disable a rule without deleting its history\n  update   Update a rule's matching policy\n  remove   Archive a rule\n  help     Print this message or the help of the given subcommand(s)",
+            "Manage rules for watched pull requests\n\nUsage: airborne rule [OPTIONS] <COMMAND>\n\nCommands:\n  add      Add a rule\n  list     List rules, optionally for one watch or preset\n  show     Show a rule and its current version\n  enable   Enable a rule and reset its baseline\n  disable  Disable a rule without deleting its history\n  update   Update a rule's matching policy\n  apply    Copy a preset's rules onto a watch\n  remove   Archive a rule\n  help     Print this message or the help of the given subcommand(s)",
         ),
         (
             vec!["alerts", "--help"],
@@ -596,7 +596,10 @@ fn pull_request_url_addresses_rule_add() {
         .to_owned();
 
     offline_json(&data, &["rule", "remove", &rule_id, "--yes"]);
-    let added = offline_json(&data, &["rule", "add", "bugbot", pull_request_url]);
+    let added = offline_json(
+        &data,
+        &["rule", "add", "bugbot", "--watch", pull_request_url],
+    );
     let watch = offline_json(&data, &["watch", "show", pull_request_url]);
 
     assert_eq!(added["data"]["watch_id"], watch["data"]["id"]);
@@ -635,6 +638,7 @@ fn rule_add_replace_archives_current_rule_and_keeps_history() {
             "rule",
             "add",
             "bugbot",
+            "--watch",
             pull_request_url,
             "--replace",
             "--check-name",
@@ -653,6 +657,159 @@ fn rule_add_replace_archives_current_rule_and_keeps_history() {
     assert_eq!(
         offline_json(&data, &["alerts", "show", &old_alert_id])["data"]["id"],
         old_alert_id
+    );
+}
+
+fn add_preset(data: &TempDir, name: &str) -> String {
+    let preset = offline_json(data, &["preset", "add", name]);
+    assert_envelope(&preset, "preset.add");
+    preset["data"]["id"].as_str().expect("preset id").to_owned()
+}
+
+#[test]
+fn presets_support_offline_crud() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let preset_id = add_preset(&data, "Release checks");
+    assert_eq!(
+        offline_json(&data, &["preset", "list"])["data"]["presets"][0]["name"],
+        "Release checks"
+    );
+
+    assert_envelope(
+        &offline_json(
+            &data,
+            &["preset", "rename", &preset_id, "Release checks v2"],
+        ),
+        "preset.rename",
+    );
+    assert_eq!(
+        offline_json(&data, &["preset", "show", "Release checks v2"])["data"]["preset"]["id"],
+        preset_id
+    );
+    assert_envelope(
+        &offline_json(&data, &["preset", "remove", "Release checks v2", "--yes"]),
+        "preset.remove",
+    );
+    assert!(offline_json(&data, &["preset", "list"])["data"]["presets"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+}
+
+#[test]
+fn presets_support_offline_rule_targeting() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let preset_id = add_preset(&data, "Release checks");
+
+    let added = offline_json(
+        &data,
+        &[
+            "rule",
+            "add",
+            "bugbot",
+            "--preset",
+            &preset_id,
+            "--check-name",
+            "Release Bugbot",
+        ],
+    );
+    assert_envelope(&added, "rule.add");
+    assert_eq!(added["data"]["preset_id"], preset_id);
+    assert_eq!(
+        offline_json(&data, &["rule", "show", "bugbot", "--preset", &preset_id])["data"]["config"]
+            ["check_name"],
+        "Release Bugbot"
+    );
+    let updated = offline_json(
+        &data,
+        &[
+            "rule",
+            "update",
+            "bugbot",
+            "--preset",
+            &preset_id,
+            "--check-name",
+            "Release Bugbot v2",
+        ],
+    );
+    assert_envelope(&updated, "rule.update");
+    assert_eq!(
+        offline_json(&data, &["rule", "list", "--preset", &preset_id])["data"]["rules"][0]
+            ["config"]["check_name"],
+        "Release Bugbot v2"
+    );
+    assert_envelope(
+        &offline_json(
+            &data,
+            &["rule", "remove", "bugbot", "--preset", &preset_id, "--yes"],
+        ),
+        "rule.remove",
+    );
+    assert!(
+        offline_json(&data, &["rule", "list", "--preset", &preset_id])["data"]["rules"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+}
+
+#[test]
+fn applying_a_preset_rejects_conflicts_or_replaces_atomically() {
+    let data = data_dir();
+    let (_source, _) = imported_fixture(&data);
+    let (watch_id, original_rule_id) = imported_watch_rule(&data);
+    let preset_id = add_preset(&data, "Release checks");
+    offline_json(
+        &data,
+        &[
+            "rule",
+            "add",
+            "bugbot",
+            "--preset",
+            &preset_id,
+            "--check-name",
+            "Release Bugbot v2",
+        ],
+    );
+    airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule", "apply", "--preset", &preset_id, "--watch", &watch_id,
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        offline_json(&data, &["rule", "show", &original_rule_id])["data"]["definition"]["config"]
+            ["check_name"],
+        "Cursor Bugbot"
+    );
+
+    let applied = offline_json(
+        &data,
+        &[
+            "rule",
+            "apply",
+            "--preset",
+            &preset_id,
+            "--watch",
+            &watch_id,
+            "--replace",
+        ],
+    );
+    assert_envelope(&applied, "rule.apply");
+    assert_eq!(applied["data"]["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        offline_json(&data, &["rule", "show", "bugbot", "--watch", &watch_id])["data"]
+            ["definition"]["config"]["check_name"],
+        "Release Bugbot v2"
+    );
+    assert!(
+        offline_json(&data, &["rule", "list", "--all"])["data"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == original_rule_id && !rule["archived_at"].is_null())
     );
 }
 
@@ -781,7 +938,7 @@ fn offline_command_result_envelopes_have_stable_command_specific_shapes() {
         &offline_json(&data, &["rule", "remove", &rule_id, "--yes"]),
         "rule.remove",
     );
-    let added = offline_json(&data, &["rule", "add", "bugbot", &watch_id]);
+    let added = offline_json(&data, &["rule", "add", "bugbot", "--watch", &watch_id]);
     assert_envelope(&added, "rule.add");
     let added_id = added["data"]["id"]
         .as_str()
@@ -1176,7 +1333,7 @@ fn duplicate_bugbot_rules_require_replace_or_archiving() {
     let duplicate = airborne()
         .args(["--data-dir"])
         .arg(data.path())
-        .args(["rule", "add", "bugbot", &watch_id])
+        .args(["rule", "add", "bugbot", "--watch", &watch_id])
         .output()
         .expect("reject duplicate rule");
     assert_eq!(duplicate.status.code(), Some(2));
@@ -1193,7 +1350,7 @@ fn duplicate_bugbot_rules_require_replace_or_archiving() {
     let disabled_duplicate = airborne()
         .args(["--data-dir"])
         .arg(data.path())
-        .args(["rule", "add", "bugbot", &watch_id])
+        .args(["rule", "add", "bugbot", "--watch", &watch_id])
         .output()
         .expect("reject disabled duplicate rule");
     assert_eq!(disabled_duplicate.status.code(), Some(2));
@@ -1205,7 +1362,7 @@ fn duplicate_bugbot_rules_require_replace_or_archiving() {
         .args(["rule", "remove", &rule_id, "--yes"])
         .assert()
         .success();
-    let added = offline_json(&data, &["rule", "add", "bugbot", &watch_id]);
+    let added = offline_json(&data, &["rule", "add", "bugbot", "--watch", &watch_id]);
     let added_id = added["data"]["id"]
         .as_str()
         .expect("added rule id")
@@ -1224,6 +1381,7 @@ fn duplicate_bugbot_rules_require_replace_or_archiving() {
             "rule",
             "add",
             "bugbot",
+            "--watch",
             &watch_id,
             "--alert-on-start",
             "--alert-if-missing-after",

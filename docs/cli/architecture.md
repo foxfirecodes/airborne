@@ -283,6 +283,7 @@ Own:
 - the database connection pool or serialized connection policy;
 - schema, forward migrations, and prototype import;
 - repository implementations for command CRUD;
+- atomic preset creation, preset application, and watch creation from a preset;
 - `RuntimeStore` and `LeaseStore` implementations;
 - atomic subject poll commits;
 - unique and foreign-key constraints;
@@ -298,6 +299,8 @@ Required logical records:
 ```text
 subject
 watch
+ preset
+ preset_rule
 rule
   rule_definition
   observation
@@ -445,8 +448,13 @@ pub trait StatusRepository {
 application service owned by runtime or CLI composition; do not let the SQLite
 repository call GitHub.
 
-`add_rule` must return a typed conflict when a non-archived rule of that kind
-already exists for the watch, including when that existing rule is disabled.
+`PresetRepository` owns preset CRUD, preset-rule CRUD, watch creation from a
+preset, and preset application. `add_rule` must return a typed conflict when a
+non-archived rule of that kind already exists for the watch, including when
+that existing rule is disabled.
+Preset application must check every target slot and either commit all copied
+rules or no copied rules. With `replace`, it must archive conflicting rules and
+create their replacements in that same transaction.
 Rule updates must distinguish policy set, policy clear, and policy unchanged so
 the CLI can implement explicit start enable/disable and missing-threshold
 set/clear flags without ambiguous optional values.

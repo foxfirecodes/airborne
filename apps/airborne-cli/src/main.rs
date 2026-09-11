@@ -20,8 +20,8 @@ use std::{
 use airborne_buildkite::{BuildSnapshot, BuildkiteApi, BuildkiteError, ReqwestBuildkiteClient};
 use airborne_core::{
     BuildkiteJobName, BuildkiteNotifyOn, BuildkiteOrganization, BuildkitePipeline,
-    GitHubStatusContext, RuleConfig, RuleId, Subject, SubjectKey, SubjectKind, Timestamp, WatchId,
-    WatchState,
+    GitHubStatusContext, PresetId, PresetRuleId, RuleConfig, RuleId, Subject, SubjectKey,
+    SubjectKind, Timestamp, WatchId, WatchState,
 };
 #[cfg(not(debug_assertions))]
 use airborne_credentials_macos::CredentialPresence;
@@ -36,7 +36,8 @@ use airborne_runtime::{
     Sleeper,
 };
 use airborne_store_sqlite::{
-    AlertRepository, CatalogRepository, NewRule, NewWatch, RuleChange, SqliteStore,
+    AlertRepository, CatalogRepository, NewPreset, NewRule, NewWatch, PresetRepository,
+    PresetRuleChange, RuleChange, SqliteStore,
 };
 use chrono::{DateTime, Local, Utc};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -87,6 +88,8 @@ enum Command {
     Watch(WatchCmd),
     /// Manage rules for watched pull requests.
     Rule(RuleCmd),
+    /// Manage reusable rule presets.
+    Preset(PresetCmd),
     /// Check active watches once, then exit.
     Refresh(Refresh),
     /// Poll active watches in the foreground.
@@ -113,8 +116,18 @@ struct WatchCmd {
 enum WatchSub {
     /// Add a pull request watch.
     Add {
+        #[arg(
+            value_name = "GITHUB_PR_URL",
+            help = "Canonical HTTPS GitHub pull request URL"
+        )]
         github_pr_url: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "PRESET_ID_OR_NAME",
+            help = "Copy this preset's rules into the new watch"
+        )]
+        preset: Option<String>,
+        #[arg(long, help = "Create the watch paused")]
         paused: bool,
     },
     /// List watches.
@@ -142,6 +155,45 @@ enum WatchSub {
     },
 }
 #[derive(Args)]
+struct PresetCmd {
+    #[command(subcommand)]
+    command: PresetSub,
+}
+#[derive(Subcommand)]
+enum PresetSub {
+    /// Add a reusable rule preset.
+    Add {
+        #[arg(value_name = "NAME", help = "A unique name for the preset")]
+        name: String,
+        #[arg(long, value_name = "DESCRIPTION", help = "Describe this preset")]
+        description: Option<String>,
+    },
+    /// List presets.
+    List {
+        #[arg(long, help = "Include archived presets")]
+        all: bool,
+    },
+    /// Show a preset and its rules.
+    Show {
+        #[arg(value_name = "PRESET_ID_OR_NAME", help = "Preset ID or name")]
+        preset_id: String,
+    },
+    /// Rename a preset.
+    Rename {
+        #[arg(value_name = "PRESET_ID_OR_NAME", help = "Preset ID or name")]
+        preset_id: String,
+        #[arg(value_name = "NEW_NAME", help = "New unique preset name")]
+        name: String,
+    },
+    /// Archive a preset.
+    Remove {
+        #[arg(value_name = "PRESET_ID_OR_NAME", help = "Preset ID or name")]
+        preset_id: String,
+        #[arg(long, help = "Skip the confirmation prompt")]
+        yes: bool,
+    },
+}
+#[derive(Args)]
 struct RuleCmd {
     #[command(subcommand)]
     command: RuleSub,
@@ -153,10 +205,21 @@ enum RuleSub {
         #[command(subcommand)]
         kind: RuleAdd,
     },
-    /// List rules, optionally for one watch.
+    /// List rules, optionally for one watch or preset.
     List {
-        #[arg(long, help = "Limit rules to one watch")]
+        #[arg(
+            long,
+            value_name = "WATCH_ID_OR_GITHUB_PR_URL",
+            help = "Limit rules to this watch"
+        )]
         watch: Option<String>,
+        #[arg(
+            long,
+            value_name = "PRESET_ID_OR_NAME",
+            conflicts_with = "watch",
+            help = "Limit rules to this preset"
+        )]
+        preset: Option<String>,
         #[arg(long, conflicts_with = "all", help = "Show enabled rules")]
         enabled: bool,
         #[arg(long, help = "Include disabled and archived rules")]
@@ -166,8 +229,19 @@ enum RuleSub {
     Show {
         #[arg(value_name = "RULE_ID_OR_NAME")]
         rule_id: String,
-        #[arg(long, help = "Select the rule on this watch (ID or GitHub PR URL)")]
+        #[arg(
+            long,
+            value_name = "WATCH_ID_OR_GITHUB_PR_URL",
+            help = "Select the rule on this watch"
+        )]
         watch: Option<String>,
+        #[arg(
+            long,
+            value_name = "PRESET_ID_OR_NAME",
+            conflicts_with = "watch",
+            help = "Select the rule in this preset"
+        )]
+        preset: Option<String>,
     },
     /// Enable a rule and reset its baseline.
     Enable {
@@ -185,12 +259,36 @@ enum RuleSub {
     },
     /// Update a rule's matching policy.
     Update(RuleUpdate),
+    /// Copy a preset's rules onto a watch.
+    Apply {
+        #[arg(long, value_name = "PRESET_ID_OR_NAME", help = "Preset to copy")]
+        preset: String,
+        #[arg(
+            long,
+            value_name = "WATCH_ID_OR_GITHUB_PR_URL",
+            help = "Watch that receives the copied rules"
+        )]
+        watch: String,
+        #[arg(long, help = "Replace same-kind rules already on the watch")]
+        replace: bool,
+    },
     /// Archive a rule.
     Remove {
         #[arg(value_name = "RULE_ID_OR_NAME")]
         rule_id: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "WATCH_ID_OR_GITHUB_PR_URL",
+            help = "Select the rule on this watch"
+        )]
         watch: Option<String>,
+        #[arg(
+            long,
+            value_name = "PRESET_ID_OR_NAME",
+            conflicts_with = "watch",
+            help = "Select the rule in this preset"
+        )]
+        preset: Option<String>,
         #[arg(long)]
         yes: bool,
     },
@@ -198,9 +296,12 @@ enum RuleSub {
 #[derive(Subcommand)]
 enum RuleAdd {
     /// Alert when Cursor Bugbot completes.
+    #[command(
+        override_usage = "airborne rule add bugbot (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) [OPTIONS]"
+    )]
     Bugbot {
-        #[arg(value_name = "WATCH_ID_OR_GITHUB_PR_URL")]
-        watch_id: String,
+        #[command(flatten)]
+        target: RuleAddTarget,
         #[arg(long, help = "Replace the current Bugbot rule, if any")]
         replace: bool,
         #[arg(long, default_value=CHECK)]
@@ -216,8 +317,8 @@ enum RuleAdd {
 }
 #[derive(Args)]
 struct BuildkiteArgs {
-    #[arg(value_name = "WATCH_ID_OR_GITHUB_PR_URL")]
-    watch_id: String,
+    #[command(flatten)]
+    target: RuleAddTarget,
     #[arg(long, help = "Replace the current Buildkite rule, if any")]
     replace: bool,
     #[arg(long)]
@@ -231,6 +332,25 @@ struct BuildkiteArgs {
     #[arg(long, value_enum, default_value_t=Notify::Terminal)]
     notify_on: Notify,
 }
+#[derive(Args)]
+struct RuleAddTarget {
+    #[arg(
+        long,
+        value_name = "WATCH_ID_OR_GITHUB_PR_URL",
+        required_unless_present = "preset",
+        conflicts_with = "preset",
+        help = "Add the rule to this watch"
+    )]
+    watch: Option<String>,
+    #[arg(
+        long,
+        value_name = "PRESET_ID_OR_NAME",
+        required_unless_present = "watch",
+        conflicts_with = "watch",
+        help = "Add the rule to this preset"
+    )]
+    preset: Option<String>,
+}
 #[derive(Clone, Copy, ValueEnum)]
 enum Notify {
     Terminal,
@@ -240,8 +360,19 @@ enum Notify {
 struct RuleUpdate {
     #[arg(value_name = "RULE_ID_OR_NAME")]
     rule_id: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "WATCH_ID_OR_GITHUB_PR_URL",
+        help = "Select the rule on this watch"
+    )]
     watch: Option<String>,
+    #[arg(
+        long,
+        value_name = "PRESET_ID_OR_NAME",
+        conflicts_with = "watch",
+        help = "Select the rule in this preset"
+    )]
+    preset: Option<String>,
     #[arg(long)]
     check_name: Option<String>,
     #[arg(long)]
@@ -482,8 +613,19 @@ fn human(command: &str, data: &Value, color: bool) -> String {
     match command {
         "watch.list" => render_watch_list(data, color),
         "watch.show" => render_watch_show(data, color),
+        "rule.list"
+            if data["rules"]
+                .as_array()
+                .and_then(|rules| rules.first())
+                .is_some_and(|rule| rule.get("preset_id").is_some()) =>
+        {
+            render_preset_rule_list(data, color)
+        }
         "rule.list" => render_rule_list(data, color),
+        "rule.show" if data.get("preset_id").is_some() => render_preset_rule_show(data, color),
         "rule.show" => render_rule_show(data, color),
+        "preset.list" => render_preset_list(data, color),
+        "preset.show" => render_preset_show(data, color),
         "alerts.list" => render_alert_list(data, color),
         "alerts.show" => render_alert_show(data, color),
         "refresh" | "run" => format!(
@@ -578,7 +720,11 @@ fn pr(subject: &Value) -> String {
     }
 }
 fn rule_name(rule: &Value) -> String {
-    let config = &rule["definition"]["config"];
+    let config = if rule["definition"]["config"].is_object() {
+        &rule["definition"]["config"]
+    } else {
+        &rule["config"]
+    };
     match text(config, "kind") {
         "git_hub_check_completes" => text(config, "check_name").to_owned(),
         "buildkite_job_completes" => format!("Buildkite · {}", text(config, "job_name")),
@@ -631,7 +777,11 @@ fn plural(count: u64, singular: &str) -> String {
     }
 }
 fn policy(rule: &Value) -> Option<String> {
-    let c = &rule["definition"]["config"];
+    let c = if rule["definition"]["config"].is_object() {
+        &rule["definition"]["config"]
+    } else {
+        &rule["config"]
+    };
     if text(c, "kind") != "git_hub_check_completes" {
         return Some("Alert on terminal result".into());
     }
@@ -937,6 +1087,91 @@ fn render_rule_list(data: &Value, color: bool) -> String {
     }
     out.join("\n")
 }
+fn render_preset_list(data: &Value, color: bool) -> String {
+    let presets = data["presets"].as_array().cloned().unwrap_or_default();
+    if presets.is_empty() {
+        return format!("{}\nNo presets.", bold("Presets", color));
+    }
+    let mut out = vec![bold("Presets", color)];
+    for preset in presets {
+        let status = if preset["archived_at"].is_null() {
+            "active"
+        } else {
+            "archived"
+        };
+        out.push(format!(
+            "\n{}  {}\n  {}",
+            bold(text(&preset, "name"), color),
+            state(status, color),
+            dim(id(&preset["id"]), color)
+        ));
+        if let Some(description) = preset["description"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+        {
+            out.push(format!("  {description}"));
+        }
+    }
+    out.join("\n")
+}
+fn render_preset_rule_list(data: &Value, color: bool) -> String {
+    let rules = data["rules"].as_array().cloned().unwrap_or_default();
+    if rules.is_empty() {
+        return format!("{}\nNo rules.", bold("Preset rules", color));
+    }
+    let mut out = vec![bold("Preset rules", color)];
+    for rule in rules {
+        out.push(format!(
+            "  {}  {}",
+            bold(rule_name(&rule), color),
+            dim(id(&rule["id"]), color)
+        ));
+        if let Some(policy) = policy(&rule) {
+            out.push(format!("    {policy}"));
+        }
+    }
+    out.join("\n")
+}
+fn render_preset_rule_show(rule: &Value, color: bool) -> String {
+    let mut out = vec![
+        bold(rule_name(rule), color),
+        format!("ID              {}", dim(id(&rule["id"]), color)),
+    ];
+    if let Some(policy) = policy(rule) {
+        out.push(policy);
+    }
+    out.join("\n")
+}
+fn render_preset_show(data: &Value, color: bool) -> String {
+    let preset = &data["preset"];
+    let mut out = vec![
+        bold(text(preset, "name"), color),
+        format!("ID              {}", dim(id(&preset["id"]), color)),
+        format!(
+            "State           {}",
+            state(
+                if preset["archived_at"].is_null() {
+                    "active"
+                } else {
+                    "archived"
+                },
+                color
+            )
+        ),
+        String::new(),
+    ];
+    if let Some(description) = preset["description"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        out.insert(2, format!("Description     {description}"));
+    }
+    out.push(render_preset_rule_list(
+        &json!({"rules": data["rules"]}),
+        color,
+    ));
+    out.join("\n")
+}
 fn render_rule_show(r: &Value, color: bool) -> String {
     let enabled = if !r["archived_at"].is_null() {
         "archived"
@@ -1142,6 +1377,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Watch(_) => "watch",
         Command::Rule(_) => "rule",
+        Command::Preset(_) => "preset",
         Command::Refresh(_) => "refresh",
         Command::Run(_) => "run",
         Command::Status(_) => "status",
@@ -1169,6 +1405,7 @@ async fn execute(cli: Cli) -> Result<(), Error> {
     match cli.command {
         Command::Watch(x) => watch(x.command, &store, &out).await,
         Command::Rule(x) => rule(x.command, &store, &out).await,
+        Command::Preset(x) => preset(x.command, &store, &out).await,
         Command::Refresh(x) => refresh(x, &store, &out).await,
         Command::Run(x) => run(x, &store, &out).await,
         Command::Status(x) => status(x, &store, &out),
@@ -1219,6 +1456,72 @@ fn now() -> Timestamp {
 }
 fn watch_id(value: String) -> Result<WatchId, Error> {
     WatchId::new(value).map_err(|e| Error::input(e.to_string()))
+}
+async fn resolve_preset_reference(store: &SqliteStore, value: &str) -> Result<PresetId, Error> {
+    if let Ok(id) = PresetId::new(value.to_owned()) {
+        if store
+            .get_preset(id.clone())
+            .await
+            .map_err(store_err)?
+            .is_some()
+        {
+            return Ok(id);
+        }
+    }
+    let matches = store
+        .list_presets(true)
+        .await
+        .map_err(store_err)?
+        .into_iter()
+        .filter(|preset| preset.name == value && preset.archived_at.is_none())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [preset] => Ok(preset.id.clone()),
+        [] => Err(Error::fail(format!("preset `{value}` was not found"))),
+        _ => Err(Error::input(format!(
+            "preset name `{value}` matches more than one preset; use the full preset ID"
+        ))),
+    }
+}
+
+fn preset_rule_matches(config: &RuleConfig, value: &str) -> bool {
+    match config {
+        RuleConfig::GitHubCheckCompletes { check_name, .. } => {
+            value == check_name || value.eq_ignore_ascii_case("bugbot")
+        }
+        RuleConfig::BuildkiteJobCompletes {
+            github_status_context,
+            job_name,
+            ..
+        } => value == github_status_context.as_str() || value == job_name.as_str(),
+    }
+}
+
+async fn resolve_preset_rule(
+    store: &SqliteStore,
+    preset_id: PresetId,
+    value: &str,
+) -> Result<airborne_core::PresetRule, Error> {
+    let rules = store
+        .list_preset_rules(preset_id)
+        .await
+        .map_err(store_err)?;
+    if let Ok(id) = PresetRuleId::new(value.to_owned()) {
+        if let Some(rule) = rules.iter().find(|rule| rule.id == id) {
+            return Ok(rule.clone());
+        }
+    }
+    let matches = rules
+        .into_iter()
+        .filter(|rule| preset_rule_matches(&rule.config, value))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [rule] => Ok(rule.clone()),
+        [] => Err(Error::fail(format!("rule `{value}` was not found"))),
+        _ => Err(Error::input(format!(
+            "rule name `{value}` matches more than one rule; use a more specific name"
+        ))),
+    }
 }
 fn resolve_watch_reference(store: &SqliteStore, value: &str) -> Result<WatchId, Error> {
     if value.starts_with("https://") {
@@ -1486,7 +1789,7 @@ async fn watch(cmd: WatchSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(),
             .map_err(|e| Error::fail(e.to_string()))?;
         return out.emit("watch.remove", json!({"archived": true}));
     }
-    match cmd { WatchSub::Add{github_pr_url,paused}=>{let key=parse_pull_request_url(&github_pr_url).map_err(|_|Error::input("expected a canonical HTTPS GitHub pull request URL"))?;let token=need(ProviderCredential::GitHub)?;let api=ReqwestGitHubApi::new(token.expose_secret().to_owned()).map_err(|e|Error::fail(e.to_string()))?;let pr=api.pull_request(&key).await.map_err(|e|Error{code:if matches!(e,airborne_github::GitHubError::AuthenticationRejected){CREDENTIAL}else{FAILURE},message:e.to_string()})?;let subject=Subject{key:SubjectKey::new(format!("github.com/{}/{}/pull/{}",key.repository.owner,key.repository.repository,key.number)).map_err(|e|Error::input(e.to_string()))?,kind:SubjectKind::GitHubPullRequest,canonical_url:github_pr_url,display_title:pr.title,current_revision:Some(pr.head_revision),metadata_refreshed_at:Some(now()),created_at:now()};let value=store.add_watch(NewWatch{subject,state:if paused{WatchState::Paused}else{WatchState::Active}}).await.map_err(store_err)?;out.emit("watch.add",json!(value))},WatchSub::List{active,..}=>out.emit("watch.list",json!({"watches":store.list_watches(active.then_some(WatchState::Active)).await.map_err(store_err)?})),WatchSub::Pause{watch_id:id}=>set_watch(store,out,id,WatchState::Paused,"watch.pause").await,WatchSub::Resume{watch_id:id}=>set_watch(store,out,id,WatchState::Active,"watch.resume").await,WatchSub::Remove{watch_id:id,yes}=>{confirm(yes,"archive this watch")?;set_watch(store,out,id,WatchState::Archived,"watch.remove").await},WatchSub::Show{..}=>Err(Error::fail("watch show requires the status repository"))}
+    match cmd { WatchSub::Add{github_pr_url,preset,paused}=>{let key=parse_pull_request_url(&github_pr_url).map_err(|_|Error::input("expected a canonical HTTPS GitHub pull request URL"))?;let token=need(ProviderCredential::GitHub)?;let api=ReqwestGitHubApi::new(token.expose_secret().to_owned()).map_err(|e|Error::fail(e.to_string()))?;let pr=api.pull_request(&key).await.map_err(|e|Error{code:if matches!(e,airborne_github::GitHubError::AuthenticationRejected){CREDENTIAL}else{FAILURE},message:e.to_string()})?;let subject=Subject{key:SubjectKey::new(format!("github.com/{}/{}/pull/{}",key.repository.owner,key.repository.repository,key.number)).map_err(|e|Error::input(e.to_string()))?,kind:SubjectKind::GitHubPullRequest,canonical_url:github_pr_url,display_title:pr.title,current_revision:Some(pr.head_revision),metadata_refreshed_at:Some(now()),created_at:now()};let draft=NewWatch{subject,state:if paused{WatchState::Paused}else{WatchState::Active}};let value=match preset {Some(reference)=>store.add_watch_from_preset(resolve_preset_reference(store,&reference).await?,draft).await, None=>store.add_watch(draft).await}.map_err(store_err)?;out.emit("watch.add",json!(value))},WatchSub::List{active,..}=>out.emit("watch.list",json!({"watches":store.list_watches(active.then_some(WatchState::Active)).await.map_err(store_err)?})),WatchSub::Pause{watch_id:id}=>set_watch(store,out,id,WatchState::Paused,"watch.pause").await,WatchSub::Resume{watch_id:id}=>set_watch(store,out,id,WatchState::Active,"watch.resume").await,WatchSub::Remove{watch_id:id,yes}=>{confirm(yes,"archive this watch")?;set_watch(store,out,id,WatchState::Archived,"watch.remove").await},WatchSub::Show{..}=>Err(Error::fail("watch show requires the status repository"))}
 }
 async fn set_watch(
     store: &Arc<SqliteStore>,
@@ -1503,13 +1806,82 @@ async fn set_watch(
             .map_err(store_err)?),
     )
 }
+async fn preset(cmd: PresetSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error> {
+    match cmd {
+        PresetSub::Add { name, description } => out.emit(
+            "preset.add",
+            json!(store
+                .add_preset(NewPreset {
+                    name,
+                    description,
+                    created_at: now(),
+                })
+                .await
+                .map_err(store_err)?),
+        ),
+        PresetSub::List { all } => {
+            let presets = store.list_presets(all).await.map_err(store_err)?;
+            out.emit("preset.list", json!({"presets": presets}))
+        }
+        PresetSub::Show {
+            preset_id: reference,
+        } => {
+            let id = resolve_preset_reference(store, &reference).await?;
+            let preset = store
+                .get_preset(id.clone())
+                .await
+                .map_err(store_err)?
+                .ok_or_else(|| Error::fail("preset was not found"))?;
+            let rules = store.list_preset_rules(id).await.map_err(store_err)?;
+            out.emit("preset.show", json!({"preset": preset, "rules": rules}))
+        }
+        PresetSub::Rename {
+            preset_id: reference,
+            name,
+        } => out.emit(
+            "preset.rename",
+            json!(store
+                .rename_preset(
+                    resolve_preset_reference(store, &reference).await?,
+                    name,
+                    now()
+                )
+                .await
+                .map_err(store_err)?),
+        ),
+        PresetSub::Remove {
+            preset_id: reference,
+            yes,
+        } => {
+            confirm(yes, "archive this preset")?;
+            let preset = store
+                .archive_preset(resolve_preset_reference(store, &reference).await?, now())
+                .await
+                .map_err(store_err)?;
+            out.emit("preset.remove", json!(preset))
+        }
+    }
+}
 async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), Error> {
     if let RuleSub::List {
         watch,
+        preset,
         enabled,
         all,
     } = &cmd
     {
+        if let Some(reference) = preset {
+            if *enabled || *all {
+                return Err(Error::input(
+                    "--enabled and --all apply only to watch rules; preset rules have no runtime state",
+                ));
+            }
+            let rules = store
+                .list_preset_rules(resolve_preset_reference(store, reference).await?)
+                .await
+                .map_err(store_err)?;
+            return out.emit("rule.list", json!({"rules": rules}));
+        }
         let watch = watch
             .as_deref()
             .map(|reference| resolve_watch_reference(store, reference))
@@ -1524,15 +1896,15 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
     }
     match cmd {
         RuleSub::Add { kind } => {
-            let (watch_id, config, replace) = match kind {
+            let (target, config, replace) = match kind {
                 RuleAdd::Bugbot {
-                    watch_id: id,
+                    target,
                     replace,
                     check_name,
                     alert_on_start,
                     alert_if_missing_after,
                 } => (
-                    resolve_watch_reference(store, &id)?,
+                    target,
                     RuleConfig::GitHubCheckCompletes {
                         check_name,
                         alert_on_start,
@@ -1542,11 +1914,45 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     replace,
                 ),
                 RuleAdd::BuildkiteJob(a) => (
-                    resolve_watch_reference(store, &a.watch_id)?,
+                    a.target,
                     buildkite(a.context, a.organization, a.pipeline, a.job, a.notify_on)?,
                     a.replace,
                 ),
             };
+            let target_preset = target.preset;
+            let target_watch = target.watch;
+            if let Some(reference) = target_preset {
+                let preset_id = resolve_preset_reference(store, &reference).await?;
+                let existing = store
+                    .list_preset_rules(preset_id.clone())
+                    .await
+                    .map_err(store_err)?
+                    .into_iter()
+                    .find(|rule| rule.config.kind() == config.kind());
+                if existing.is_some() && !replace {
+                    return Err(Error::input(format!(
+                        "this preset already has a {} rule; pass --replace to replace it",
+                        rule_kind_name(config.kind()),
+                    )));
+                }
+                let result = if let Some(existing) = existing {
+                    store
+                        .update_preset_rule(PresetRuleChange {
+                            id: existing.id,
+                            config,
+                            at: now(),
+                        })
+                        .await
+                } else {
+                    store.add_preset_rule(preset_id, config, now()).await
+                }
+                .map_err(store_err)?;
+                return out.emit("rule.add", json!(result));
+            }
+            let watch_id = resolve_watch_reference(
+                store,
+                &target_watch.expect("clap requires --watch or --preset"),
+            )?;
             if let Some(existing) = store
                 .list_rules(Some(&watch_id))
                 .map_err(|e| Error::fail(e.to_string()))?
@@ -1588,11 +1994,42 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
         RuleSub::Disable { rule_id: id, watch } => {
             set_rule(store, out, id, watch, false, "rule.disable").await
         }
+        RuleSub::Apply {
+            preset,
+            watch,
+            replace,
+        } => {
+            let rules = store
+                .apply_preset(
+                    resolve_preset_reference(store, &preset).await?,
+                    resolve_watch_reference(store, &watch)?,
+                    replace,
+                    now(),
+                )
+                .await
+                .map_err(rule_add_err)?;
+            out.emit("rule.apply", json!({"rules": rules}))
+        }
         RuleSub::Remove {
             rule_id: id,
             watch,
+            preset,
             yes,
         } => {
+            if let Some(reference) = preset {
+                let rule = resolve_preset_rule(
+                    store,
+                    resolve_preset_reference(store, &reference).await?,
+                    &id,
+                )
+                .await?;
+                confirm(yes, "remove this preset rule")?;
+                store
+                    .remove_preset_rule(rule.id, now())
+                    .await
+                    .map_err(store_err)?;
+                return out.emit("rule.remove", json!({"removed": true}));
+            }
             let id = resolve_rule_reference(store, &id, watch.as_deref())?;
             confirm(yes, "archive this rule")?;
             store
@@ -1607,7 +2044,20 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 .transpose()?;
             out.emit("rule.list", json!({"rules":store.list_rules(watch.as_ref()).map_err(|e|Error::fail(e.to_string()))?}))
         }
-        RuleSub::Show { rule_id: id, watch } => {
+        RuleSub::Show {
+            rule_id: id,
+            watch,
+            preset,
+        } => {
+            if let Some(reference) = preset {
+                let rule = resolve_preset_rule(
+                    store,
+                    resolve_preset_reference(store, &reference).await?,
+                    &id,
+                )
+                .await?;
+                return out.emit("rule.show", json!(rule));
+            }
             let id = resolve_rule_reference(store, &id, watch.as_deref())?;
             out.emit(
                 "rule.show",
@@ -1633,12 +2083,38 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     "rule update requires at least one changed option",
                 ));
             }
-            let id = resolve_rule_reference(store, &update.rule_id, update.watch.as_deref())?;
-            let definition = store
-                .get_rule_definition(&id)
-                .map_err(|e| Error::fail(e.to_string()))?
-                .ok_or_else(|| Error::fail("rule was not found"))?;
-            let config = match definition.config {
+            let preset_rule = if let Some(reference) = &update.preset {
+                Some(
+                    resolve_preset_rule(
+                        store,
+                        resolve_preset_reference(store, reference).await?,
+                        &update.rule_id,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let id = if preset_rule.is_none() {
+                Some(resolve_rule_reference(
+                    store,
+                    &update.rule_id,
+                    update.watch.as_deref(),
+                )?)
+            } else {
+                None
+            };
+            let current_config = match &preset_rule {
+                Some(rule) => rule.config.clone(),
+                None => {
+                    store
+                        .get_rule_definition(id.as_ref().expect("runtime rule ID"))
+                        .map_err(|e| Error::fail(e.to_string()))?
+                        .ok_or_else(|| Error::fail("rule was not found"))?
+                        .config
+                }
+            };
+            let config = match current_config {
                 RuleConfig::GitHubCheckCompletes {
                     check_name,
                     alert_on_start,
@@ -1710,17 +2186,31 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     )?
                 }
             };
-            out.emit(
-                "rule.update",
-                json!(store
-                    .update_rule(RuleChange {
-                        id,
-                        config,
-                        at: now()
-                    })
-                    .await
-                    .map_err(store_err)?),
-            )
+            if let Some(rule) = preset_rule {
+                out.emit(
+                    "rule.update",
+                    json!(store
+                        .update_preset_rule(PresetRuleChange {
+                            id: rule.id,
+                            config,
+                            at: now(),
+                        })
+                        .await
+                        .map_err(store_err)?),
+                )
+            } else {
+                out.emit(
+                    "rule.update",
+                    json!(store
+                        .update_rule(RuleChange {
+                            id: id.expect("runtime rule ID"),
+                            config,
+                            at: now()
+                        })
+                        .await
+                        .map_err(store_err)?),
+                )
+            }
         }
     }
 }
@@ -2315,5 +2805,23 @@ mod tests {
             "latest_observation":null
         });
         assert!(render_rule_show(&rule, false).contains("Organization     acme"));
+    }
+
+    #[test]
+    fn preset_views_render_description_archival_state_and_rule_id() {
+        let preset = json!({
+            "id":"preset-1", "name":"CI", "description":"Default checks",
+            "archived_at":"2026-09-11T00:00:00Z"
+        });
+        let rule = json!({
+            "id":"preset_rule-1", "config":{"kind":"git_hub_check_completes", "check_name":"Cursor Bugbot"}
+        });
+        assert!(
+            render_preset_list(&json!({"presets":[preset.clone()]}), false).contains("archived")
+        );
+        let output = render_preset_show(&json!({"preset":preset, "rules":[rule]}), false);
+        assert!(output.contains("Default checks"));
+        assert!(output.contains("archived"));
+        assert!(output.contains("preset_rule"));
     }
 }
