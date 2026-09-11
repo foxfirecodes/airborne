@@ -54,6 +54,29 @@ Run `airborne run` to keep polling in the foreground. Press Ctrl-C to stop it.
 Run `airborne --help` or `airborne <COMMAND> --help` for all commands and
 options.
 
+### Example w/ system notifications
+
+```bash
+# watch for bugbot status on the PR
+airborne watch add https://github.com/OWNER/REPO/pull/123
+airborne rule add bugbot \
+  --alert-on-start \
+  --alert-if-missing-after 3m \
+  https://github.com/OWNER/REPO/pull/123
+
+# shell A: run the poller
+airborne run | tee /tmp/airborne.log
+
+# shell B: get system notifications whenever there are new alerts
+tail -n 1 -f /tmp/airborne.log | \
+    grep -v '0 new alert(s)' --line-buffered | \
+    while read -r line; do
+        echo "new alert"
+        sleep 0.5
+        terminal-notifier -message "$(airborne alerts list --json | jq -r '.data.alerts[] | .subject.key + " - " + .title' | head -n 1)"
+    done
+```
+
 ## Notes
 
 - Tokens entered with `airborne auth set` go to your macOS Keychain and never
