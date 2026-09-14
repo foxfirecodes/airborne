@@ -92,8 +92,10 @@ Subject
   created_at
 ```
 
-The subject is remote identity and cached display data. It does not contain
-user policy. A later subject kind gets its own typed key and monitor.
+The subject is remote identity and cached display data. Its stored subject key
+decodes into the typed key for its subject kind; the canonical URL is display
+and navigation data, not an identity source. It does not contain user policy.
+A later subject kind gets its own typed key and monitor.
 
 ### 4.2 Watch
 
@@ -122,6 +124,7 @@ Preset
   id
   name
   description?
+  subject_kind
   created_at
   updated_at
   archived_at?
@@ -134,9 +137,9 @@ PresetRule
   updated_at
 ```
 
-A preset is a reusable rule template, not a watch. Its rules have no enabled
-flag, version, observations, alerts, or lifecycle state. A preset may have at
-most one rule of each kind.
+A preset is a reusable rule template for one subject kind, not a watch. Its
+rules have no enabled flag, version, observations, alerts, or lifecycle state.
+A preset may have at most one rule of each kind.
 
 Adding a watch with a preset copies every preset rule into new, enabled watch
 rules at version `1`, in the same transaction as the watch. Applying a preset

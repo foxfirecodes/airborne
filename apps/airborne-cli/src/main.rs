@@ -20,8 +20,8 @@ use std::{
 use airborne_buildkite::{BuildSnapshot, BuildkiteApi, BuildkiteError, ReqwestBuildkiteClient};
 use airborne_core::{
     BuildkiteJobName, BuildkiteNotifyOn, BuildkiteOrganization, BuildkitePipeline,
-    GitHubStatusContext, PresetId, PresetRuleId, RuleConfig, RuleId, Subject, SubjectKey,
-    SubjectKind, Timestamp, WatchId, WatchState,
+    GitHubStatusContext, PresetId, PresetRuleId, RuleConfig, RuleId, SubjectKey, SubjectKind,
+    Timestamp, WatchId, WatchState,
 };
 #[cfg(not(debug_assertions))]
 use airborne_credentials_macos::CredentialPresence;
@@ -29,8 +29,8 @@ use airborne_credentials_macos::{
     CredentialError, CredentialStore, ExposeSecret, MacosCredentialStore, ProviderCredential,
     SecretString,
 };
-use airborne_github::{parse_pull_request_url, GitHubApi, ReqwestGitHubApi};
-use airborne_pr::GitHubPullRequestMonitor;
+use airborne_github::{parse_pull_request_url, ReqwestGitHubApi};
+use airborne_pr::{resolve_pull_request_subject, GitHubPullRequestMonitor, ResolveSubjectError};
 use airborne_runtime::{
     Cancellation, Clock, NeverCancelled, RefreshReport, RefreshScope, Runtime, RuntimeStore,
     Sleeper,
@@ -1789,7 +1789,71 @@ async fn watch(cmd: WatchSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(),
             .map_err(|e| Error::fail(e.to_string()))?;
         return out.emit("watch.remove", json!({"archived": true}));
     }
-    match cmd { WatchSub::Add{github_pr_url,preset,paused}=>{let key=parse_pull_request_url(&github_pr_url).map_err(|_|Error::input("expected a canonical HTTPS GitHub pull request URL"))?;let token=need(ProviderCredential::GitHub)?;let api=ReqwestGitHubApi::new(token.expose_secret().to_owned()).map_err(|e|Error::fail(e.to_string()))?;let pr=api.pull_request(&key).await.map_err(|e|Error{code:if matches!(e,airborne_github::GitHubError::AuthenticationRejected){CREDENTIAL}else{FAILURE},message:e.to_string()})?;let subject=Subject{key:SubjectKey::new(format!("github.com/{}/{}/pull/{}",key.repository.owner,key.repository.repository,key.number)).map_err(|e|Error::input(e.to_string()))?,kind:SubjectKind::GitHubPullRequest,canonical_url:github_pr_url,display_title:pr.title,current_revision:Some(pr.head_revision),metadata_refreshed_at:Some(now()),created_at:now()};let draft=NewWatch{subject,state:if paused{WatchState::Paused}else{WatchState::Active}};let value=match preset {Some(reference)=>store.add_watch_from_preset(resolve_preset_reference(store,&reference).await?,draft).await, None=>store.add_watch(draft).await}.map_err(store_err)?;out.emit("watch.add",json!(value))},WatchSub::List{active,..}=>out.emit("watch.list",json!({"watches":store.list_watches(active.then_some(WatchState::Active)).await.map_err(store_err)?})),WatchSub::Pause{watch_id:id}=>set_watch(store,out,id,WatchState::Paused,"watch.pause").await,WatchSub::Resume{watch_id:id}=>set_watch(store,out,id,WatchState::Active,"watch.resume").await,WatchSub::Remove{watch_id:id,yes}=>{confirm(yes,"archive this watch")?;set_watch(store,out,id,WatchState::Archived,"watch.remove").await},WatchSub::Show{..}=>Err(Error::fail("watch show requires the status repository"))}
+    match cmd {
+        WatchSub::Add {
+            github_pr_url,
+            preset,
+            paused,
+        } => {
+            let token = need(ProviderCredential::GitHub)?;
+            let api = ReqwestGitHubApi::new(token.expose_secret().to_owned())
+                .map_err(|error| Error::fail(error.to_string()))?;
+            let subject = resolve_pull_request_subject(&api, github_pr_url, now())
+                .await
+                .map_err(|error| match error {
+                    ResolveSubjectError::InvalidUrl | ResolveSubjectError::Domain(_) => {
+                        Error::input(error.to_string())
+                    }
+                    ResolveSubjectError::Provider(provider) => Error {
+                        code: if matches!(
+                            provider,
+                            airborne_github::GitHubError::AuthenticationRejected
+                        ) {
+                            CREDENTIAL
+                        } else {
+                            FAILURE
+                        },
+                        message: provider.to_string(),
+                    },
+                })?;
+            let draft = NewWatch {
+                subject,
+                state: if paused {
+                    WatchState::Paused
+                } else {
+                    WatchState::Active
+                },
+            };
+            let value = match preset {
+                Some(reference) => {
+                    store
+                        .add_watch_from_preset(
+                            resolve_preset_reference(store, &reference).await?,
+                            draft,
+                        )
+                        .await
+                }
+                None => store.add_watch(draft).await,
+            }
+            .map_err(store_err)?;
+            out.emit("watch.add", json!(value))
+        }
+        WatchSub::List { active, .. } => out.emit(
+            "watch.list",
+            json!({"watches":store.list_watches(active.then_some(WatchState::Active)).await.map_err(store_err)?}),
+        ),
+        WatchSub::Pause { watch_id: id } => {
+            set_watch(store, out, id, WatchState::Paused, "watch.pause").await
+        }
+        WatchSub::Resume { watch_id: id } => {
+            set_watch(store, out, id, WatchState::Active, "watch.resume").await
+        }
+        WatchSub::Remove { watch_id: id, yes } => {
+            confirm(yes, "archive this watch")?;
+            set_watch(store, out, id, WatchState::Archived, "watch.remove").await
+        }
+        WatchSub::Show { .. } => Err(Error::fail("watch show requires the status repository")),
+    }
 }
 async fn set_watch(
     store: &Arc<SqliteStore>,
@@ -1814,6 +1878,7 @@ async fn preset(cmd: PresetSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(
                 .add_preset(NewPreset {
                     name,
                     description,
+                    subject_kind: SubjectKind::GitHubPullRequest,
                     created_at: now(),
                 })
                 .await

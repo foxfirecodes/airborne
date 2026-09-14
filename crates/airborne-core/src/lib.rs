@@ -28,6 +28,8 @@ pub enum DomainError {
     InvalidRuleDefinition,
     #[error("pull request number must be at least 1")]
     InvalidPullRequestNumber,
+    #[error("subject key does not match its subject kind")]
+    InvalidSubjectKey,
     #[error("timestamp must be UTC RFC 3339: {0}")]
     InvalidTimestamp(String),
     #[error("a candidate alert intent must use the candidate source identity")]
@@ -203,6 +205,11 @@ pub struct GitHubPullRequestKey {
     pub repository: GitHubRepositoryKey,
     pub number: GitHubPullRequestNumber,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SubjectIdentity {
+    GitHubPullRequest(GitHubPullRequestKey),
+}
 impl GitHubPullRequestKey {
     pub fn new(repository: GitHubRepositoryKey, number: GitHubPullRequestNumber) -> Self {
         Self { repository, number }
@@ -275,6 +282,52 @@ pub struct Subject {
     pub metadata_refreshed_at: Option<Timestamp>,
     pub created_at: Timestamp,
 }
+impl Subject {
+    pub fn identity(&self) -> Result<SubjectIdentity, DomainError> {
+        match self.kind {
+            SubjectKind::GitHubPullRequest => parse_github_pull_request_subject_key(&self.key)
+                .map(SubjectIdentity::GitHubPullRequest),
+        }
+    }
+}
+
+impl SubjectKey {
+    pub fn for_github_pull_request(key: &GitHubPullRequestKey) -> Result<Self, DomainError> {
+        Self::new(format!(
+            "{}/{}/{}/pull/{}",
+            key.repository.host, key.repository.owner, key.repository.repository, key.number
+        ))
+    }
+}
+
+fn parse_github_pull_request_subject_key(
+    value: &SubjectKey,
+) -> Result<GitHubPullRequestKey, DomainError> {
+    let parts = value.as_str().split('/').collect::<Vec<_>>();
+    let (host, owner, repository, number) = match parts.as_slice() {
+        [host, owner, repository, "pull", number] => (*host, *owner, *repository, *number),
+        [host, owner, repository_and_number] => {
+            let (repository, number) = repository_and_number
+                .rsplit_once('#')
+                .ok_or(DomainError::InvalidSubjectKey)?;
+            (*host, *owner, repository, number)
+        }
+        _ => return Err(DomainError::InvalidSubjectKey),
+    };
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| GitHubPullRequestNumber::new(value).ok())
+        .ok_or(DomainError::InvalidSubjectKey)?;
+    Ok(GitHubPullRequestKey::new(
+        GitHubRepositoryKey::new(
+            host,
+            GitHubOwner::new(owner)?,
+            GitHubRepository::new(repository)?,
+        )?,
+        number,
+    ))
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchState {
@@ -340,6 +393,13 @@ impl RuleConfig {
             Self::BuildkiteJobCompletes { .. } => RuleKind::BuildkiteJobCompletes,
         }
     }
+    pub const fn subject_kind(&self) -> SubjectKind {
+        match self {
+            Self::GitHubCheckCompletes { .. } | Self::BuildkiteJobCompletes { .. } => {
+                SubjectKind::GitHubPullRequest
+            }
+        }
+    }
     pub fn validate(&self) -> Result<(), DomainError> {
         if matches!(
             self,
@@ -367,6 +427,7 @@ pub struct Preset {
     pub id: PresetId,
     pub name: String,
     pub description: Option<String>,
+    pub subject_kind: SubjectKind,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub archived_at: Option<Timestamp>,
@@ -900,6 +961,23 @@ mod tests {
         assert!(Revision::new("x\ny").is_err());
         assert!(RuleVersion::new(0).is_err());
         assert!(GitHubPullRequestNumber::new(0).is_err());
+    }
+    #[test]
+    fn subject_identity_comes_from_the_stored_key_not_the_display_url() {
+        let subject = Subject {
+            key: SubjectKey::new("github.com/acme/airborne/pull/42").unwrap(),
+            kind: SubjectKind::GitHubPullRequest,
+            canonical_url: "https://example.test/not-an-identity".into(),
+            display_title: "Typed identity".into(),
+            current_revision: None,
+            metadata_refreshed_at: None,
+            created_at: ts(),
+        };
+        let SubjectIdentity::GitHubPullRequest(key) = subject.identity().unwrap();
+        assert_eq!(key.repository.host, "github.com");
+        assert_eq!(key.repository.owner.as_str(), "acme");
+        assert_eq!(key.repository.repository.as_str(), "airborne");
+        assert_eq!(key.number.get(), 42);
     }
     #[test]
     fn timestamp_serializes_canonical_utc_rfc3339() {

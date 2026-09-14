@@ -14,8 +14,8 @@ use std::{
 use airborne_core::{
     Alert, AlertEventKind, AlertId, AlertKey, CandidateState, Observation, Preset, PresetId,
     PresetRule, PresetRuleId, Rule, RuleConfig, RuleDefinition, RuleHistory, RuleHistorySet,
-    RuleId, RuleKey, RuleKind, RuleVersion, SourceIdentity, Subject, SubjectKey, Timestamp,
-    VersionedRule, Watch, WatchId, WatchState,
+    RuleId, RuleKey, RuleKind, RuleVersion, SourceIdentity, Subject, SubjectKey, SubjectKind,
+    Timestamp, VersionedRule, Watch, WatchId, WatchState,
 };
 use airborne_runtime::{
     LeaseError, LeaseGuard, LeaseStore, RefreshLease, RefreshScope, RefreshTarget, RunnerLease,
@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const LATEST_SCHEMA: i64 = 7;
+const LATEST_SCHEMA: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
@@ -167,6 +167,7 @@ pub struct RuleChange {
 pub struct NewPreset {
     pub name: String,
     pub description: Option<String>,
+    pub subject_kind: SubjectKind,
     pub created_at: Timestamp,
 }
 
@@ -913,6 +914,17 @@ fn parse_watch_state(value: String) -> std::result::Result<WatchState, StoreErro
         _ => Err(store_error("database has an unknown watch state")),
     }
 }
+fn subject_kind_text(value: SubjectKind) -> &'static str {
+    match value {
+        SubjectKind::GitHubPullRequest => "github_pull_request",
+    }
+}
+fn parse_subject_kind(value: String) -> std::result::Result<SubjectKind, StoreError> {
+    match value.as_str() {
+        "github_pull_request" => Ok(SubjectKind::GitHubPullRequest),
+        _ => Err(store_error("database has an unknown subject kind")),
+    }
+}
 fn rule_kind_text(value: RuleKind) -> &'static str {
     match value {
         RuleKind::GitHubCheckCompletes => "github_check_completes",
@@ -1110,16 +1122,12 @@ fn read_subject_shifted(
     let revision: Option<String> = row.get(offset + 5)?;
     let refreshed: Option<String> = row.get(offset + 6)?;
     let created: String = row.get(offset + 7)?;
-    if kind != "github_pull_request" {
-        return Err(store_sql(store_error(
-            "database has an unknown subject kind",
-        )));
-    }
+    let kind = parse_subject_kind(kind).map_err(store_sql)?;
     Ok((
         id,
         Subject {
             key: SubjectKey::new(key).map_err(domain_sql)?,
-            kind: airborne_core::SubjectKind::GitHubPullRequest,
+            kind,
             canonical_url: url,
             display_title: title,
             current_revision: revision
@@ -1430,16 +1438,12 @@ fn read_subject(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Subject)> {
     let revision: Option<String> = row.get(5)?;
     let refreshed: Option<String> = row.get(6)?;
     let created: String = row.get(7)?;
-    if kind != "github_pull_request" {
-        return Err(store_sql(store_error(
-            "database has an unknown subject kind",
-        )));
-    }
+    let kind = parse_subject_kind(kind).map_err(store_sql)?;
     Ok((
         id,
         Subject {
             key: SubjectKey::new(key).map_err(domain_sql)?,
-            kind: airborne_core::SubjectKind::GitHubPullRequest,
+            kind,
             canonical_url: url,
             display_title: title,
             current_revision: revision
@@ -1585,6 +1589,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .map_err(SqliteStoreError::Storage)?;
         migrate_v7(&tx)?;
         tx.execute("INSERT INTO schema_migration(version) VALUES (7)", [])
+            .map_err(SqliteStoreError::Storage)?;
+        tx.commit().map_err(SqliteStoreError::Storage)?;
+    }
+    if current <= 7 {
+        let tx = connection
+            .transaction()
+            .map_err(SqliteStoreError::Storage)?;
+        migrate_v8(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (8)", [])
             .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     }
@@ -1759,17 +1772,28 @@ fn migrate_v7(tx: &Transaction<'_>) -> Result<()> {
     .map_err(SqliteStoreError::Storage)
 }
 
+fn migrate_v8(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "ALTER TABLE preset ADD COLUMN subject_kind TEXT NOT NULL DEFAULT 'github_pull_request'",
+        [],
+    )
+    .map_err(SqliteStoreError::Storage)?;
+    Ok(())
+}
+
 fn read_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Preset> {
     let id: String = row.get(0)?;
     let name: String = row.get(1)?;
     let description: Option<String> = row.get(2)?;
-    let created_at: String = row.get(3)?;
-    let updated_at: String = row.get(4)?;
-    let archived_at: Option<String> = row.get(5)?;
+    let subject_kind: String = row.get(3)?;
+    let created_at: String = row.get(4)?;
+    let updated_at: String = row.get(5)?;
+    let archived_at: Option<String> = row.get(6)?;
     Ok(Preset {
         id: PresetId::new(id).map_err(domain_sql)?,
         name,
         description,
+        subject_kind: parse_subject_kind(subject_kind).map_err(store_sql)?,
         created_at: text_timestamp(created_at).map_err(store_sql)?,
         updated_at: text_timestamp(updated_at).map_err(store_sql)?,
         archived_at: archived_at
@@ -1804,19 +1828,23 @@ fn active_preset_rules(
     tx: &Transaction<'_>,
     preset_id: &PresetId,
 ) -> std::result::Result<Vec<PresetRule>, StoreError> {
-    let state: Option<String> = tx
+    let preset: Option<(String, String)> = tx
         .query_row(
-            "SELECT state FROM preset WHERE id=?",
+            "SELECT state,subject_kind FROM preset WHERE id=?",
             [preset_id.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(store_error)?;
-    match state.as_deref() {
-        Some("active") => {}
-        Some("archived") => return Err(store_error("preset is archived")),
-        _ => return Err(store_error("preset was not found")),
+    let Some((state, subject_kind)) = preset else {
+        return Err(store_error("preset was not found"));
+    };
+    match state.as_str() {
+        "active" => {}
+        "archived" => return Err(store_error("preset is archived")),
+        _ => return Err(store_error("database has an unknown preset state")),
     }
+    let subject_kind = parse_subject_kind(subject_kind)?;
     let mut statement = tx
         .prepare(
             "SELECT id,preset_id,definition,created_at,updated_at FROM preset_rule WHERE preset_id=? ORDER BY created_at,kind",
@@ -1829,8 +1857,45 @@ fn active_preset_rules(
         .map_err(store_error)?;
     for rule in &rules {
         rule.config.validate().map_err(store_error)?;
+        if rule.config.subject_kind() != subject_kind {
+            return Err(store_error(
+                "preset contains a rule for a different subject kind",
+            ));
+        }
     }
     Ok(rules)
+}
+
+fn preset_subject_kind(
+    tx: &Transaction<'_>,
+    preset_id: &PresetId,
+) -> std::result::Result<SubjectKind, StoreError> {
+    let kind = tx
+        .query_row(
+            "SELECT subject_kind FROM preset WHERE id=? AND state='active'",
+            [preset_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_error)?
+        .ok_or_else(|| store_error("preset was not found or is archived"))?;
+    parse_subject_kind(kind)
+}
+
+fn watch_subject_kind(
+    tx: &Transaction<'_>,
+    watch_id: &WatchId,
+) -> std::result::Result<SubjectKind, StoreError> {
+    let kind = tx
+        .query_row(
+            "SELECT s.kind FROM watch w JOIN subject s ON s.id=w.subject_id WHERE w.id=?",
+            [watch_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_error)?
+        .ok_or_else(|| store_error("watch was not found"))?;
+    parse_subject_kind(kind)
 }
 
 fn insert_runtime_rule(
@@ -1875,13 +1940,13 @@ impl PresetRepository for SqliteStore {
         let id = PresetId::new(uid("preset")).map_err(store_error)?;
         let at = sql_timestamp(&draft.created_at);
         tx.execute(
-            "INSERT INTO preset(id,name,description,state,created_at,updated_at) VALUES (?,?,?,'active',?,?)",
-            params![id.as_str(), draft.name, draft.description, at, at],
+            "INSERT INTO preset(id,name,description,subject_kind,state,created_at,updated_at) VALUES (?,?,?,?,'active',?,?)",
+            params![id.as_str(), draft.name, draft.description, subject_kind_text(draft.subject_kind), at, at],
         )
         .map_err(store_error)?;
         let preset = tx
             .query_row(
-                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                "SELECT id,name,description,subject_kind,created_at,updated_at,archived_at FROM preset WHERE id=?",
                 [id.as_str()],
                 read_preset,
             )
@@ -1898,7 +1963,7 @@ impl PresetRepository for SqliteStore {
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
-        let mut statement = connection.prepare("SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE (?1 OR state='active') ORDER BY created_at,id").map_err(store_error)?;
+        let mut statement = connection.prepare("SELECT id,name,description,subject_kind,created_at,updated_at,archived_at FROM preset WHERE (?1 OR state='active') ORDER BY created_at,id").map_err(store_error)?;
         let presets = statement
             .query_map([include_archived], read_preset)
             .map_err(store_error)?
@@ -1912,7 +1977,7 @@ impl PresetRepository for SqliteStore {
             .lock()
             .map_err(|_| store_error("database lock failed"))?
             .query_row(
-                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                "SELECT id,name,description,subject_kind,created_at,updated_at,archived_at FROM preset WHERE id=?",
                 [id.as_str()],
                 read_preset,
             )
@@ -1946,7 +2011,7 @@ impl PresetRepository for SqliteStore {
         }
         let preset = tx
             .query_row(
-                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                "SELECT id,name,description,subject_kind,created_at,updated_at,archived_at FROM preset WHERE id=?",
                 [id.as_str()],
                 read_preset,
             )
@@ -1971,7 +2036,7 @@ impl PresetRepository for SqliteStore {
         }
         let preset = tx
             .query_row(
-                "SELECT id,name,description,created_at,updated_at,archived_at FROM preset WHERE id=?",
+                "SELECT id,name,description,subject_kind,created_at,updated_at,archived_at FROM preset WHERE id=?",
                 [id.as_str()],
                 read_preset,
             )
@@ -1995,6 +2060,11 @@ impl PresetRepository for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
         active_preset_rules(&tx, &preset_id)?;
+        if config.subject_kind() != preset_subject_kind(&tx, &preset_id)? {
+            return Err(store_error(
+                "rule is not compatible with this preset's subject kind",
+            ));
+        }
         let timestamp = sql_timestamp(&at);
         let id = PresetRuleId::new(uid("preset_rule")).map_err(store_error)?;
         tx.execute("INSERT INTO preset_rule(id,preset_id,kind,definition,created_at,updated_at) VALUES (?,?,?,?,?,?)", params![id.as_str(), preset_id.as_str(), rule_kind_text(config.kind()), serde_json::to_string(&config).map_err(store_error)?, timestamp, timestamp]).map_err(store_error)?;
@@ -2038,6 +2108,11 @@ impl PresetRepository for SqliteStore {
             return Err(store_error("preset rule kind cannot change"));
         }
         active_preset_rules(&tx, &preset_id)?;
+        if change.config.subject_kind() != preset_subject_kind(&tx, &preset_id)? {
+            return Err(store_error(
+                "rule is not compatible with this preset's subject kind",
+            ));
+        }
         if tx
             .execute(
                 "UPDATE preset_rule SET definition=?,updated_at=? WHERE id=?",
@@ -2134,6 +2209,11 @@ impl PresetRepository for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
         let preset_rules = active_preset_rules(&tx, &preset_id)?;
+        if preset_subject_kind(&tx, &preset_id)? != draft.subject.kind {
+            return Err(store_error(
+                "preset is not compatible with this subject kind",
+            ));
+        }
         if let Some((id, state)) = tx.query_row("SELECT w.id,w.state FROM subject s JOIN watch w ON w.subject_id=s.id WHERE s.subject_key=? ORDER BY w.created_at DESC LIMIT 1", [draft.subject.key.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional().map_err(store_error)? {
             return Err(store_error(if state == "paused" {
                 format!("watch {id} is paused; run airborne watch resume {id}")
@@ -2144,7 +2224,7 @@ impl PresetRepository for SqliteStore {
             }));
         }
         let at = sql_timestamp(&draft.subject.created_at);
-        tx.execute("INSERT INTO subject(subject_key,kind,canonical_url,title,revision,metadata_refreshed_at,created_at,updated_at) VALUES (?1,'github_pull_request',?2,?3,?4,?5,?6,?6)", params![draft.subject.key.as_str(), draft.subject.canonical_url, draft.subject.display_title, draft.subject.current_revision.as_ref().map(|value| value.as_str()), draft.subject.metadata_refreshed_at.as_ref().map(sql_timestamp), at]).map_err(store_error)?;
+        tx.execute("INSERT INTO subject(subject_key,kind,canonical_url,title,revision,metadata_refreshed_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)", params![draft.subject.key.as_str(), subject_kind_text(draft.subject.kind), draft.subject.canonical_url, draft.subject.display_title, draft.subject.current_revision.as_ref().map(|value| value.as_str()), draft.subject.metadata_refreshed_at.as_ref().map(sql_timestamp), at]).map_err(store_error)?;
         let subject_id: i64 = tx
             .query_row(
                 "SELECT id FROM subject WHERE subject_key=?",
@@ -2177,6 +2257,11 @@ impl PresetRepository for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
         let preset_rules = active_preset_rules(&tx, &preset_id)?;
+        if preset_subject_kind(&tx, &preset_id)? != watch_subject_kind(&tx, &watch_id)? {
+            return Err(store_error(
+                "preset is not compatible with this watch's subject kind",
+            ));
+        }
         let state: Option<String> = tx
             .query_row(
                 "SELECT state FROM watch WHERE id=?",
@@ -2250,7 +2335,7 @@ impl CatalogRepository for SqliteStore {
         {
             return Err(store_error(if state == "paused" { format!("watch {id} is paused; run airborne watch resume {id}") } else if state == "archived" { format!("watch {id} is archived; archived history prevents re-adding this subject") } else { format!("watch {id} already exists and is active") }));
         }
-        tx.execute("INSERT INTO subject(subject_key,kind,canonical_url,title,revision,metadata_refreshed_at,created_at,updated_at) VALUES (?1,'github_pull_request',?2,?3,?4,?5,?6,?6) ON CONFLICT(subject_key) DO UPDATE SET canonical_url=excluded.canonical_url,title=excluded.title,revision=excluded.revision,metadata_refreshed_at=excluded.metadata_refreshed_at,updated_at=excluded.updated_at", params![draft.subject.key.as_str(), draft.subject.canonical_url, draft.subject.display_title, draft.subject.current_revision.as_ref().map(|x| x.as_str()), draft.subject.metadata_refreshed_at.as_ref().map(sql_timestamp), sql_timestamp(&draft.subject.created_at)]).map_err(store_error)?;
+        tx.execute("INSERT INTO subject(subject_key,kind,canonical_url,title,revision,metadata_refreshed_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7) ON CONFLICT(subject_key) DO UPDATE SET kind=excluded.kind,canonical_url=excluded.canonical_url,title=excluded.title,revision=excluded.revision,metadata_refreshed_at=excluded.metadata_refreshed_at,updated_at=excluded.updated_at", params![draft.subject.key.as_str(), subject_kind_text(draft.subject.kind), draft.subject.canonical_url, draft.subject.display_title, draft.subject.current_revision.as_ref().map(|x| x.as_str()), draft.subject.metadata_refreshed_at.as_ref().map(sql_timestamp), sql_timestamp(&draft.subject.created_at)]).map_err(store_error)?;
         let subject_id: i64 = tx
             .query_row(
                 "SELECT id FROM subject WHERE subject_key=?",
@@ -2339,6 +2424,11 @@ impl CatalogRepository for SqliteStore {
             }
             _ => {}
         }
+        if draft.config.subject_kind() != watch_subject_kind(&tx, &draft.watch_id)? {
+            return Err(store_error(
+                "rule is not compatible with this watch's subject kind",
+            ));
+        }
         if let Some(existing_rule_id) =
             existing_live_rule(&tx, &draft.watch_id, draft.config.kind())?
         {
@@ -2376,6 +2466,11 @@ impl CatalogRepository for SqliteStore {
         let current: Rule = tx.query_row("SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=? AND state='active'", [change.id.as_str()], read_rule).optional().map_err(store_error)?.ok_or_else(|| store_error("rule was not found"))?;
         if current.kind != change.config.kind() {
             return Err(store_error("rule kind cannot change"));
+        }
+        if change.config.subject_kind() != watch_subject_kind(&tx, &current.watch_id)? {
+            return Err(store_error(
+                "rule is not compatible with this watch's subject kind",
+            ));
         }
         let next = current
             .current_version
@@ -2474,6 +2569,11 @@ impl RuntimeStore for SqliteStore {
                 if config.kind() != rule.kind {
                     return Err(store_error(
                         "stored rule definition does not match its rule",
+                    ));
+                }
+                if config.subject_kind() != subject.kind {
+                    return Err(store_error(
+                        "stored rule is not compatible with its subject kind",
                     ));
                 }
                 versioned.push(VersionedRule {
@@ -2783,7 +2883,7 @@ mod tests {
     fn makes_all_logical_tables_and_reopens() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), LATEST_SCHEMA);
         store.integrity_check().unwrap();
         drop(store);
         assert_eq!(
@@ -2791,20 +2891,20 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            7
+            LATEST_SCHEMA
         );
     }
     #[test]
-    fn v7_migration_adds_preset_tables_without_touching_runtime_history() {
+    fn preset_migrations_add_subject_scope_without_touching_runtime_history() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let store = SqliteStore::open(file.path()).unwrap();
         {
             let connection = store.connection.lock().unwrap();
-            connection.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); DROP TABLE preset_rule; DROP TABLE preset; DELETE FROM schema_migration WHERE version=7;").unwrap();
+            connection.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); DROP TABLE preset_rule; DROP TABLE preset; DELETE FROM schema_migration WHERE version>=7;").unwrap();
         }
         drop(store);
         let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), LATEST_SCHEMA);
         let connection = store.connection.lock().unwrap();
         assert_eq!(
             connection
@@ -2817,6 +2917,28 @@ mod tests {
                 .get::<_, i64>(0))
             .is_ok());
     }
+    #[test]
+    fn v8_scopes_existing_presets_to_pull_requests() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::open(file.path()).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute_batch("DROP TABLE preset_rule; DROP TABLE preset; CREATE TABLE preset (id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,description TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,archived_at TEXT); CREATE TABLE preset_rule (id TEXT PRIMARY KEY,preset_id TEXT NOT NULL,kind TEXT NOT NULL,definition TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO preset VALUES ('preset-1','CI',NULL,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL); DELETE FROM schema_migration WHERE version=8;").unwrap();
+        }
+        drop(store);
+        let store = SqliteStore::open(file.path()).unwrap();
+        let preset = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id,name,description,subject_kind,created_at,updated_at,archived_at FROM preset WHERE id='preset-1'",
+                [],
+                read_preset,
+            )
+            .unwrap();
+        assert_eq!(preset.subject_kind, SubjectKind::GitHubPullRequest);
+    }
     #[tokio::test]
     async fn presets_archive_without_releasing_their_names() {
         let store = SqliteStore::memory().unwrap();
@@ -2824,6 +2946,7 @@ mod tests {
             .add_preset(NewPreset {
                 name: "CI".into(),
                 description: Some("shared checks".into()),
+                subject_kind: SubjectKind::GitHubPullRequest,
                 created_at: at(),
             })
             .await
@@ -2888,6 +3011,7 @@ mod tests {
             .add_preset(NewPreset {
                 name: "CI".into(),
                 description: None,
+                subject_kind: SubjectKind::GitHubPullRequest,
                 created_at: at()
             })
             .await
@@ -2906,6 +3030,7 @@ mod tests {
             .add_preset(NewPreset {
                 name: "CI".into(),
                 description: None,
+                subject_kind: SubjectKind::GitHubPullRequest,
                 created_at: at(),
             })
             .await
@@ -2965,6 +3090,7 @@ mod tests {
             .add_preset(NewPreset {
                 name: "CI".into(),
                 description: None,
+                subject_kind: SubjectKind::GitHubPullRequest,
                 created_at: at(),
             })
             .await
@@ -3003,6 +3129,7 @@ mod tests {
             .add_preset(NewPreset {
                 name: "CI".into(),
                 description: None,
+                subject_kind: SubjectKind::GitHubPullRequest,
                 created_at: at(),
             })
             .await
@@ -3467,7 +3594,7 @@ mod tests {
         for version in [1, 2, 3] {
             let file = legacy_database_with_alert(version);
             let store = SqliteStore::open(file.path()).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 7);
+            assert_eq!(store.schema_version().unwrap(), LATEST_SCHEMA);
             let c = store.connection.lock().unwrap();
             assert_eq!(
                 c.query_row("SELECT watch_id FROM alert", [], |r| r.get::<_, String>(0))
@@ -3500,7 +3627,7 @@ mod tests {
         c.execute_batch("CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT); INSERT INTO schema_migration VALUES(4,'x'); CREATE TABLE subject(id INTEGER PRIMARY KEY,subject_key TEXT); CREATE TABLE watch(id TEXT PRIMARY KEY,subject_id INTEGER); CREATE TABLE rule(id TEXT PRIMARY KEY,watch_id TEXT,kind TEXT,enabled INTEGER,current_version INTEGER,state TEXT,created_at TEXT,updated_at TEXT,archived_at TEXT); CREATE TABLE rule_definition(rule_id TEXT,version INTEGER,encoding_version INTEGER,definition TEXT,created_at TEXT,PRIMARY KEY(rule_id,version)); CREATE TABLE observation(id INTEGER PRIMARY KEY,rule_id TEXT,rule_version INTEGER,revision TEXT,state TEXT,source_identity TEXT,source_url TEXT,detail TEXT,observed_at TEXT); CREATE TABLE alert(id TEXT PRIMARY KEY,rule_id TEXT,rule_version INTEGER,watch_id TEXT,subject_key TEXT,rule_kind TEXT,revision TEXT,source_identity TEXT,title TEXT,body TEXT,status TEXT,source_url TEXT,created_at TEXT,acknowledged_at TEXT); INSERT INTO subject VALUES(1,'s'); INSERT INTO watch VALUES('w',1); INSERT INTO rule VALUES('first','w','github_check_completes',1,1,'active','2026-01-01T00:00:00Z','x',NULL),('later','w','github_check_completes',1,1,'active','2026-01-02T00:00:00Z','x',NULL); INSERT INTO rule_definition VALUES('first',1,1,'{}','x'),('later',1,1,'{}','x'); INSERT INTO observation VALUES(1,'first',1,'v','completed','source',NULL,NULL,'2026-01-03T00:00:00Z'); INSERT INTO alert VALUES('a','first',1,'w','s','github_check_completes','v','source','t','b','pending',NULL,'x',NULL);").unwrap();
         drop(c);
         let store = SqliteStore::open(file.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), LATEST_SCHEMA);
         let c = store.connection.lock().unwrap();
         assert_eq!(
             c.query_row("SELECT event_kind FROM alert", [], |r| r

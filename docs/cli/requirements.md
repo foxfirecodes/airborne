@@ -141,8 +141,10 @@ airborne preset rename <PRESET_ID_OR_NAME> <NEW_NAME>
 airborne preset remove <PRESET_ID_OR_NAME> [--yes]
 ```
 
-A preset holds reusable rule definitions, not running rules. It has no watch,
-enabled state, versions, observations, or alerts. It may have a description.
+A preset holds reusable rule definitions for one subject kind, not running
+rules. Version 1 creates GitHub pull request presets. It has no watch, enabled
+state, versions, observations, or alerts. It may have a description. Airborne
+must reject a rule or watch whose subject kind does not match the preset.
 Preset names stay unique, including names held by archived presets. `preset
 remove` archives the preset and does not free its name. `preset show` includes
 its rule definitions; `preset list` omits archived presets unless `--all` is

@@ -575,6 +575,8 @@ models alone cannot prove provider compatibility.
 
 A new subject type must add a typed subject key, typed rules, and one monitor.
 It may reuse runtime and storage ports. Do not add a generic JSON fact map.
+Rules and presets declare their subject kind. Command and storage writes reject
+incompatible pairs before a monitor runs.
 
 A desktop app, daemon, MCP server, or notifier may become another outer host or
 adapter. It must consume the same runtime and committed alert records. It must

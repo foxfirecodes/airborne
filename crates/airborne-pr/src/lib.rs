@@ -19,8 +19,8 @@ use airborne_buildkite::{
 };
 use airborne_core::{
     multi_job_source_identity, AlertIntent, BuildkiteBuildKey, Candidate, CandidateState, Provider,
-    RuleConfig, SourceIdentity, SourceIssueDraft, SourceIssueScope, SubjectKind,
-    SubjectMetadataUpdate, VersionedRule,
+    RuleConfig, SourceIdentity, SourceIssueDraft, SourceIssueScope, Subject, SubjectIdentity,
+    SubjectKey, SubjectKind, SubjectMetadataUpdate, Timestamp, VersionedRule,
 };
 use airborne_github::{
     parse_pull_request_url, CheckRun, CommitStatus, GitHubApi, GitHubError, PullRequestSnapshot,
@@ -28,8 +28,44 @@ use airborne_github::{
 use airborne_runtime::{MonitorReport, MonitorRequest, RulePollResult, SubjectMonitor};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
+
+#[derive(Debug, Error)]
+pub enum ResolveSubjectError {
+    #[error("expected a canonical HTTPS GitHub pull request URL")]
+    InvalidUrl,
+    #[error(transparent)]
+    Provider(#[from] GitHubError),
+    #[error(transparent)]
+    Domain(#[from] airborne_core::DomainError),
+}
+
+/// Resolves user input into the typed GitHub pull request subject stored by Airborne.
+///
+/// # Errors
+///
+/// Returns an error when the URL is invalid, GitHub cannot read the pull request,
+/// or the resulting subject identity is invalid.
+pub async fn resolve_pull_request_subject(
+    github: &dyn GitHubApi,
+    canonical_url: String,
+    at: Timestamp,
+) -> Result<Subject, ResolveSubjectError> {
+    let key =
+        parse_pull_request_url(&canonical_url).map_err(|_| ResolveSubjectError::InvalidUrl)?;
+    let snapshot = github.pull_request(&key).await?;
+    Ok(Subject {
+        key: SubjectKey::for_github_pull_request(&key)?,
+        kind: SubjectKind::GitHubPullRequest,
+        canonical_url,
+        display_title: snapshot.title,
+        current_revision: Some(snapshot.head_revision),
+        metadata_refreshed_at: Some(at.clone()),
+        created_at: at,
+    })
+}
 
 /// Total provider requests allowed across every PR monitor in this process.
 pub const MAX_CONCURRENT_PROVIDER_REQUESTS: usize = 8;
@@ -68,12 +104,12 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
             ));
             return report;
         }
-        let key = match parse_pull_request_url(&request.subject.canonical_url) {
-            Ok(key) => key,
+        let key = match request.subject.identity() {
+            Ok(SubjectIdentity::GitHubPullRequest(key)) => key,
             Err(_) => {
                 report.subject_issue = Some(subject_issue(
                     "invalid_subject",
-                    "subject has an invalid GitHub pull request URL",
+                    "subject has an invalid GitHub pull request identity",
                     false,
                 ));
                 return report;

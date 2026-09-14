@@ -16,6 +16,7 @@ airborne-runtime = { path = "../airborne-runtime" }
 async-trait = "0.1"
 chrono = "0.4"
 tokio = { version = "1", features = ["sync"] }
+thiserror = "2"
 url = "2"
 
 [dev-dependencies]

@@ -109,6 +109,7 @@ dependencies = [
  "airborne-runtime",
  "async-trait",
  "chrono",
+ "thiserror",
  "tokio",
  "url",
 ]
