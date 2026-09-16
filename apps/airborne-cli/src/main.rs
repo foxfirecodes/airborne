@@ -20,8 +20,8 @@ use std::{
 use airborne_buildkite::{BuildSnapshot, BuildkiteApi, BuildkiteError, ReqwestBuildkiteClient};
 use airborne_core::{
     BuildkiteJobName, BuildkiteNotifyOn, BuildkiteOrganization, BuildkitePipeline,
-    GitHubStatusContext, PresetId, PresetRuleId, RuleConfig, RuleId, SubjectKey, SubjectKind,
-    Timestamp, WatchId, WatchState,
+    GitHubStatusContext, GitHubStatusNotifyOn, PresetId, PresetRuleId, RuleConfig, RuleId,
+    SubjectKey, SubjectKind, Timestamp, WatchId, WatchState,
 };
 #[cfg(not(debug_assertions))]
 use airborne_credentials_macos::CredentialPresence;
@@ -311,6 +311,9 @@ enum RuleAdd {
         #[arg(long, value_parser = parse_positive_duration, help = "Alert if Bugbot is not detected after this delay (for example, 5m)")]
         alert_if_missing_after: Option<Duration>,
     },
+    #[command(name = "github-status")]
+    /// Alert when a GitHub commit status reaches a selected result.
+    GitHubStatus(GitHubStatusArgs),
     #[command(name = "buildkite-job")]
     /// Alert when a Buildkite job completes.
     BuildkiteJob(BuildkiteArgs),
@@ -329,8 +332,22 @@ struct BuildkiteArgs {
     pipeline: String,
     #[arg(long)]
     job: String,
-    #[arg(long, value_enum, default_value_t=Notify::Terminal)]
-    notify_on: Notify,
+    #[arg(long, value_enum, default_value_t=BuildkiteNotify::Terminal)]
+    notify_on: BuildkiteNotify,
+}
+#[derive(Args)]
+#[command(
+    override_usage = "airborne rule add github-status [OPTIONS] <--watch <WATCH>|--preset <PRESET>>"
+)]
+struct GitHubStatusArgs {
+    #[command(flatten)]
+    target: RuleAddTarget,
+    #[arg(long, help = "Replace the matching GitHub status rule, if any")]
+    replace: bool,
+    #[arg(long, help = "Exact GitHub commit status context to watch")]
+    context: String,
+    #[arg(long, value_enum, default_value_t=StatusNotify::Terminal, help = "Choose which result creates an alert")]
+    notify_on: StatusNotify,
 }
 #[derive(Args)]
 struct RuleAddTarget {
@@ -352,9 +369,25 @@ struct RuleAddTarget {
     preset: Option<String>,
 }
 #[derive(Clone, Copy, ValueEnum)]
-enum Notify {
+enum BuildkiteNotify {
     Terminal,
     Passed,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum StatusNotify {
+    /// Alert on success, failure, or error.
+    Terminal,
+    /// Alert only on success.
+    Success,
+    /// Alert on failure or error.
+    Failure,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum UpdateNotify {
+    Terminal,
+    Passed,
+    Success,
+    Failure,
 }
 #[derive(Args)]
 struct RuleUpdate {
@@ -384,7 +417,7 @@ struct RuleUpdate {
     #[arg(long)]
     job: Option<String>,
     #[arg(long, value_enum)]
-    notify_on: Option<Notify>,
+    notify_on: Option<UpdateNotify>,
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_alert_on_start")]
     alert_on_start: bool,
     #[arg(long = "no-alert-on-start", action = ArgAction::SetTrue, conflicts_with = "alert_on_start")]
@@ -727,12 +760,71 @@ fn rule_name(rule: &Value) -> String {
     };
     match text(config, "kind") {
         "git_hub_check_completes" => text(config, "check_name").to_owned(),
+        "git_hub_status_completes" => {
+            format!("GitHub status · {}", text(config, "context"))
+        }
         "buildkite_job_completes" => format!("Buildkite · {}", text(config, "job_name")),
         _ => text(
             rule["rule"].as_object().map_or(rule, |_| &rule["rule"]),
             "kind",
         )
         .replace('_', " "),
+    }
+}
+fn key_component(value: &str, escape_slash: bool) -> String {
+    let value = value.replace('%', "%25").replace(':', "%3A");
+    if escape_slash {
+        value.replace('/', "%2F")
+    } else {
+        value
+    }
+}
+fn config_rule_reference(config: &RuleConfig) -> String {
+    match config {
+        RuleConfig::GitHubCheckCompletes { check_name, .. } => {
+            format!("github-check:{}", key_component(check_name, false))
+        }
+        RuleConfig::GitHubStatusCompletes { context, .. } => {
+            format!("github-status:{}", key_component(context.as_str(), false))
+        }
+        RuleConfig::BuildkiteJobCompletes {
+            github_status_context,
+            expected_organization,
+            expected_pipeline,
+            job_name,
+            ..
+        } => format!(
+            "buildkite-job:{}:{}/{}:{}",
+            key_component(github_status_context.as_str(), false),
+            key_component(expected_organization.as_str(), true),
+            key_component(expected_pipeline.as_str(), true),
+            key_component(job_name.as_str(), false)
+        ),
+    }
+}
+fn rule_reference(rule: &Value) -> String {
+    let config = if rule["definition"]["config"].is_object() {
+        &rule["definition"]["config"]
+    } else {
+        &rule["config"]
+    };
+    match text(config, "kind") {
+        "git_hub_check_completes" => format!(
+            "github-check:{}",
+            key_component(text(config, "check_name"), false)
+        ),
+        "git_hub_status_completes" => format!(
+            "github-status:{}",
+            key_component(text(config, "context"), false)
+        ),
+        "buildkite_job_completes" => format!(
+            "buildkite-job:{}:{}/{}:{}",
+            key_component(text(config, "github_status_context"), false),
+            key_component(text(config, "expected_organization"), true),
+            key_component(text(config, "expected_pipeline"), true),
+            key_component(text(config, "job_name"), false)
+        ),
+        _ => String::new(),
     }
 }
 fn observation_state(rule: &Value) -> String {
@@ -1083,7 +1175,13 @@ fn render_rule_list(data: &Value, color: bool) -> String {
             .expect("write to string");
         }
         out.push(format!("  {line}"));
-        out.push(format!("  {}", dim(id(&r["id"]), color)));
+        out.push(format!(
+            "  {}",
+            dim(
+                format!("{}  ·  {}", rule_reference(&r), id(&r["id"])),
+                color
+            )
+        ));
     }
     out.join("\n")
 }
@@ -1126,6 +1224,7 @@ fn render_preset_rule_list(data: &Value, color: bool) -> String {
             bold(rule_name(&rule), color),
             dim(id(&rule["id"]), color)
         ));
+        out.push(format!("    {}", dim(rule_reference(&rule), color)));
         if let Some(policy) = policy(&rule) {
             out.push(format!("    {policy}"));
         }
@@ -1136,6 +1235,7 @@ fn render_preset_rule_show(rule: &Value, color: bool) -> String {
     let mut out = vec![
         bold(rule_name(rule), color),
         format!("ID              {}", dim(id(&rule["id"]), color)),
+        format!("Reference       {}", rule_reference(rule)),
     ];
     if let Some(policy) = policy(rule) {
         out.push(policy);
@@ -1186,24 +1286,30 @@ fn render_rule_show(r: &Value, color: bool) -> String {
         format!("{}  {}", bold(&check, color), state(enabled, color)),
         bold(pr(&r["subject"]), color),
         String::new(),
+        format!("Reference       {}", rule_reference(r)),
     ];
     let config = &r["definition"]["config"];
-    if text(config, "kind") == "git_hub_check_completes" {
-        out.push(format!("Check name       {check}"));
-    } else {
-        out.push(format!("Job              {}", text(config, "job_name")));
-        out.push(format!(
-            "Context          {}",
-            text(config, "github_status_context")
-        ));
-        out.push(format!(
-            "Organization     {}",
-            text(config, "expected_organization")
-        ));
-        out.push(format!(
-            "Pipeline         {}",
-            text(config, "expected_pipeline")
-        ));
+    match text(config, "kind") {
+        "git_hub_check_completes" => out.push(format!("Check name       {check}")),
+        "git_hub_status_completes" => {
+            out.push(format!("Context          {}", text(config, "context")));
+            out.push(format!("Notify on        {}", text(config, "notify_on")));
+        }
+        _ => {
+            out.push(format!("Job              {}", text(config, "job_name")));
+            out.push(format!(
+                "Context          {}",
+                text(config, "github_status_context")
+            ));
+            out.push(format!(
+                "Organization     {}",
+                text(config, "expected_organization")
+            ));
+            out.push(format!(
+                "Pipeline         {}",
+                text(config, "expected_pipeline")
+            ));
+        }
     }
     out.extend([
         format!("Current state    {}", state(&rule_display_state(r), color)),
@@ -1485,10 +1591,14 @@ async fn resolve_preset_reference(store: &SqliteStore, value: &str) -> Result<Pr
 }
 
 fn preset_rule_matches(config: &RuleConfig, value: &str) -> bool {
+    if value == config_rule_reference(config) {
+        return true;
+    }
     match config {
         RuleConfig::GitHubCheckCompletes { check_name, .. } => {
             value == check_name || value.eq_ignore_ascii_case("bugbot")
         }
+        RuleConfig::GitHubStatusCompletes { context, .. } => value == context.as_str(),
         RuleConfig::BuildkiteJobCompletes {
             github_status_context,
             job_name,
@@ -1565,9 +1675,11 @@ fn resolve_rule_reference(
     let matches = rules
         .into_iter()
         .filter(|rule| match &rule.definition.config {
+            config if value == config_rule_reference(config) => true,
             RuleConfig::GitHubCheckCompletes { check_name, .. } => {
                 value == check_name || value.eq_ignore_ascii_case("bugbot")
             }
+            RuleConfig::GitHubStatusCompletes { context, .. } => value == context.as_str(),
             RuleConfig::BuildkiteJobCompletes {
                 github_status_context,
                 job_name,
@@ -1978,6 +2090,11 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     },
                     replace,
                 ),
+                RuleAdd::GitHubStatus(args) => (
+                    args.target,
+                    github_status(args.context, args.notify_on)?,
+                    args.replace,
+                ),
                 RuleAdd::BuildkiteJob(a) => (
                     a.target,
                     buildkite(a.context, a.organization, a.pipeline, a.job, a.notify_on)?,
@@ -2195,7 +2312,7 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                         || update.notify_on.is_some()
                     {
                         return Err(Error::input(
-                            "buildkite options cannot update a bugbot rule",
+                            "status and Buildkite options cannot update a bugbot rule",
                         ));
                     }
                     RuleConfig::GitHubCheckCompletes {
@@ -2236,7 +2353,7 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                             "Bugbot alert options cannot update a Buildkite rule",
                         ));
                     }
-                    buildkite(
+                    buildkite_for_update(
                         update
                             .context
                             .unwrap_or_else(|| github_status_context.into_inner()),
@@ -2248,8 +2365,31 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                             .unwrap_or_else(|| expected_pipeline.into_inner()),
                         update.job.unwrap_or_else(|| job_name.into_inner()),
                         update.notify_on.unwrap_or(match notify_on {
-                            BuildkiteNotifyOn::Terminal => Notify::Terminal,
-                            BuildkiteNotifyOn::Passed => Notify::Passed,
+                            BuildkiteNotifyOn::Terminal => UpdateNotify::Terminal,
+                            BuildkiteNotifyOn::Passed => UpdateNotify::Passed,
+                        }),
+                    )?
+                }
+                RuleConfig::GitHubStatusCompletes { context, notify_on } => {
+                    if update.check_name.is_some()
+                        || update.organization.is_some()
+                        || update.pipeline.is_some()
+                        || update.job.is_some()
+                        || update.alert_on_start
+                        || update.no_alert_on_start
+                        || update.alert_if_missing_after.is_some()
+                        || update.no_alert_if_missing_after
+                    {
+                        return Err(Error::input(
+                            "only --context and --notify-on can update a GitHub status rule",
+                        ));
+                    }
+                    github_status_for_update(
+                        update.context.unwrap_or_else(|| context.into_inner()),
+                        update.notify_on.unwrap_or(match notify_on {
+                            GitHubStatusNotifyOn::Terminal => UpdateNotify::Terminal,
+                            GitHubStatusNotifyOn::Success => UpdateNotify::Success,
+                            GitHubStatusNotifyOn::Failure => UpdateNotify::Failure,
                         }),
                     )?
                 }
@@ -2287,7 +2427,7 @@ fn buildkite(
     organization: String,
     pipeline: String,
     job: String,
-    notify: Notify,
+    notify: BuildkiteNotify,
 ) -> Result<RuleConfig, Error> {
     Ok(RuleConfig::BuildkiteJobCompletes {
         github_status_context: GitHubStatusContext::new(context)
@@ -2298,10 +2438,54 @@ fn buildkite(
             .map_err(|e| Error::input(e.to_string()))?,
         job_name: BuildkiteJobName::new(job).map_err(|e| Error::input(e.to_string()))?,
         notify_on: match notify {
-            Notify::Terminal => BuildkiteNotifyOn::Terminal,
-            Notify::Passed => BuildkiteNotifyOn::Passed,
+            BuildkiteNotify::Terminal => BuildkiteNotifyOn::Terminal,
+            BuildkiteNotify::Passed => BuildkiteNotifyOn::Passed,
         },
     })
+}
+
+fn buildkite_for_update(
+    context: String,
+    organization: String,
+    pipeline: String,
+    job: String,
+    notify: UpdateNotify,
+) -> Result<RuleConfig, Error> {
+    let notify = match notify {
+        UpdateNotify::Terminal => BuildkiteNotify::Terminal,
+        UpdateNotify::Passed => BuildkiteNotify::Passed,
+        UpdateNotify::Success | UpdateNotify::Failure => {
+            return Err(Error::input(
+                "Buildkite --notify-on must be terminal or passed",
+            ))
+        }
+    };
+    buildkite(context, organization, pipeline, job, notify)
+}
+
+fn github_status(context: String, notify: StatusNotify) -> Result<RuleConfig, Error> {
+    Ok(RuleConfig::GitHubStatusCompletes {
+        context: GitHubStatusContext::new(context).map_err(|e| Error::input(e.to_string()))?,
+        notify_on: match notify {
+            StatusNotify::Terminal => GitHubStatusNotifyOn::Terminal,
+            StatusNotify::Success => GitHubStatusNotifyOn::Success,
+            StatusNotify::Failure => GitHubStatusNotifyOn::Failure,
+        },
+    })
+}
+
+fn github_status_for_update(context: String, notify: UpdateNotify) -> Result<RuleConfig, Error> {
+    let notify = match notify {
+        UpdateNotify::Terminal => StatusNotify::Terminal,
+        UpdateNotify::Success => StatusNotify::Success,
+        UpdateNotify::Failure => StatusNotify::Failure,
+        UpdateNotify::Passed => {
+            return Err(Error::input(
+                "GitHub status --notify-on must be terminal, success, or failure",
+            ))
+        }
+    };
+    github_status(context, notify)
 }
 async fn set_rule(
     store: &Arc<SqliteStore>,
@@ -2797,6 +2981,7 @@ fn rule_add_err(e: airborne_runtime::StoreError) -> Error {
 fn rule_kind_name(kind: airborne_core::RuleKind) -> &'static str {
     match kind {
         airborne_core::RuleKind::GitHubCheckCompletes => "Bugbot",
+        airborne_core::RuleKind::GitHubStatusCompletes => "GitHub status",
         airborne_core::RuleKind::BuildkiteJobCompletes => "Buildkite job",
     }
 }
@@ -2823,6 +3008,29 @@ mod tests {
         assert_eq!(refresh_exit(airborne_core::PollOutcome::Success), 0);
         assert_eq!(refresh_exit(airborne_core::PollOutcome::Partial), PARTIAL);
         assert_eq!(refresh_exit(airborne_core::PollOutcome::Failure), FAILURE);
+    }
+
+    #[test]
+    fn qualified_rule_references_are_stable_and_escape_separators() {
+        let status = RuleConfig::GitHubStatusCompletes {
+            context: GitHubStatusContext::new("ci/main:lint%strict").unwrap(),
+            notify_on: GitHubStatusNotifyOn::Terminal,
+        };
+        assert_eq!(
+            config_rule_reference(&status),
+            "github-status:ci/main%3Alint%25strict"
+        );
+        let buildkite = RuleConfig::BuildkiteJobCompletes {
+            github_status_context: GitHubStatusContext::new("buildkite/main").unwrap(),
+            expected_organization: BuildkiteOrganization::new("acme/tools").unwrap(),
+            expected_pipeline: BuildkitePipeline::new("app").unwrap(),
+            job_name: BuildkiteJobName::new("lint:strict").unwrap(),
+            notify_on: BuildkiteNotifyOn::Terminal,
+        };
+        assert_eq!(
+            config_rule_reference(&buildkite),
+            "buildkite-job:buildkite/main:acme%2Ftools/app:lint%3Astrict"
+        );
     }
 
     #[test]

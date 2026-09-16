@@ -349,13 +349,14 @@ pub struct Watch {
 #[serde(rename_all = "snake_case")]
 pub enum RuleKind {
     GitHubCheckCompletes,
+    GitHubStatusCompletes,
     BuildkiteJobCompletes,
 }
 impl RuleKind {
     pub const fn max_instances_per_target(self) -> Option<usize> {
         match self {
             Self::GitHubCheckCompletes => Some(1),
-            Self::BuildkiteJobCompletes => None,
+            Self::GitHubStatusCompletes | Self::BuildkiteJobCompletes => None,
         }
     }
 }
@@ -363,6 +364,9 @@ impl RuleKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleInstanceKey {
     GitHubCheckCompletes,
+    GitHubStatusCompletes {
+        context: GitHubStatusContext,
+    },
     BuildkiteJobCompletes {
         github_status_context: GitHubStatusContext,
         expected_organization: BuildkiteOrganization,
@@ -387,6 +391,13 @@ pub enum BuildkiteNotifyOn {
     Terminal,
     Passed,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubStatusNotifyOn {
+    Terminal,
+    Success,
+    Failure,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuleConfig {
@@ -396,6 +407,10 @@ pub enum RuleConfig {
         alert_on_start: bool,
         #[serde(default)]
         alert_if_missing_after_seconds: Option<u64>,
+    },
+    GitHubStatusCompletes {
+        context: GitHubStatusContext,
+        notify_on: GitHubStatusNotifyOn,
     },
     BuildkiteJobCompletes {
         github_status_context: GitHubStatusContext,
@@ -409,19 +424,23 @@ impl RuleConfig {
     pub const fn kind(&self) -> RuleKind {
         match self {
             Self::GitHubCheckCompletes { .. } => RuleKind::GitHubCheckCompletes,
+            Self::GitHubStatusCompletes { .. } => RuleKind::GitHubStatusCompletes,
             Self::BuildkiteJobCompletes { .. } => RuleKind::BuildkiteJobCompletes,
         }
     }
     pub const fn subject_kind(&self) -> SubjectKind {
         match self {
-            Self::GitHubCheckCompletes { .. } | Self::BuildkiteJobCompletes { .. } => {
-                SubjectKind::GitHubPullRequest
-            }
+            Self::GitHubCheckCompletes { .. }
+            | Self::GitHubStatusCompletes { .. }
+            | Self::BuildkiteJobCompletes { .. } => SubjectKind::GitHubPullRequest,
         }
     }
     pub fn instance_key(&self) -> RuleInstanceKey {
         match self {
             Self::GitHubCheckCompletes { .. } => RuleInstanceKey::GitHubCheckCompletes,
+            Self::GitHubStatusCompletes { context, .. } => RuleInstanceKey::GitHubStatusCompletes {
+                context: context.clone(),
+            },
             Self::BuildkiteJobCompletes {
                 github_status_context,
                 expected_organization,
@@ -1017,6 +1036,10 @@ mod tests {
     }
     #[test]
     fn rule_instance_identity_excludes_alert_policy() {
+        let status = |context: &str, notify_on| RuleConfig::GitHubStatusCompletes {
+            context: GitHubStatusContext::new(context).unwrap(),
+            notify_on,
+        };
         let buildkite = |job: &str, notify_on| RuleConfig::BuildkiteJobCompletes {
             github_status_context: GitHubStatusContext::new("buildkite/main").unwrap(),
             expected_organization: BuildkiteOrganization::new("acme").unwrap(),
@@ -1033,8 +1056,20 @@ mod tests {
             buildkite("lint", BuildkiteNotifyOn::Terminal).instance_key()
         );
         assert_eq!(
+            status("buildkite/main", GitHubStatusNotifyOn::Terminal).instance_key(),
+            status("buildkite/main", GitHubStatusNotifyOn::Failure).instance_key()
+        );
+        assert_ne!(
+            status("buildkite/main", GitHubStatusNotifyOn::Terminal).instance_key(),
+            status("deploy/preview", GitHubStatusNotifyOn::Terminal).instance_key()
+        );
+        assert_eq!(
             RuleKind::GitHubCheckCompletes.max_instances_per_target(),
             Some(1)
+        );
+        assert_eq!(
+            RuleKind::GitHubStatusCompletes.max_instances_per_target(),
+            None
         );
         assert_eq!(
             RuleKind::BuildkiteJobCompletes.max_instances_per_target(),

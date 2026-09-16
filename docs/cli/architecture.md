@@ -205,9 +205,10 @@ Fetch-plan rules:
 
 - Fetch the PR once.
 - Fetch check runs only when a check rule needs them.
-- Fetch commit statuses only when a Buildkite rule needs them.
+- Fetch commit statuses only when a GitHub status or Buildkite rule needs them.
 - Fetch each derived Buildkite build once.
-- Do not let a failed check-run request suppress Buildkite work or the reverse.
+- Do not let a failed check-run request suppress status/Buildkite work or the
+  reverse.
 - A failed PR lookup stops that subject because no current revision is known.
 
 ### 4.5 `airborne-runtime`

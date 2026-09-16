@@ -583,6 +583,18 @@ fn human_rule_references_address_rule_commands() {
         &["rule", "enable", "bugbot", "--watch", pull_request_url],
     );
     assert_eq!(enabled["data"]["enabled"], true);
+
+    let qualified = offline_json(
+        &data,
+        &[
+            "rule",
+            "show",
+            "github-check:buildkite/discord-admin",
+            "--watch",
+            pull_request_url,
+        ],
+    );
+    assert_eq!(qualified["data"]["id"], enabled["data"]["id"]);
 }
 
 #[test]
@@ -1466,6 +1478,18 @@ fn distinct_buildkite_jobs_share_a_watch_and_replace_only_the_matching_job() {
     assert!(rules
         .iter()
         .any(|rule| rule["id"] == replacement && rule["archived_at"].is_null()));
+
+    let shown = offline_json(
+        &data,
+        &[
+            "rule",
+            "show",
+            "buildkite-job:buildkite/main:acme/app:lint",
+            "--watch",
+            &watch_id,
+        ],
+    );
+    assert_eq!(shown["data"]["id"], lint);
 }
 
 #[test]
@@ -1519,4 +1543,148 @@ fn presets_allow_distinct_buildkite_jobs_but_not_duplicate_instances() {
         ])
         .assert()
         .code(2);
+}
+
+#[test]
+fn distinct_github_statuses_share_a_watch_and_replace_only_the_matching_context() {
+    let data = data_dir();
+    let (watch_id, _) = imported_watch_rule(&data);
+    let add = |context: &str, extra: &[&str]| {
+        let mut args = vec![
+            "rule",
+            "add",
+            "github-status",
+            "--watch",
+            &watch_id,
+            "--context",
+            context,
+        ];
+        args.extend_from_slice(extra);
+        offline_json(&data, &args)
+    };
+    let build = add("buildkite/main", &[])["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deploy = add("deploy/preview", &[])["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(build, deploy);
+
+    airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule",
+            "add",
+            "github-status",
+            "--watch",
+            &watch_id,
+            "--context",
+            "buildkite/main",
+        ])
+        .assert()
+        .code(2);
+
+    let replacement = add("buildkite/main", &["--replace", "--notify-on", "failure"])["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rules = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(rules
+        .iter()
+        .any(|rule| rule["id"] == deploy && rule["archived_at"].is_null()));
+    assert!(rules
+        .iter()
+        .any(|rule| rule["id"] == build && !rule["archived_at"].is_null()));
+    assert!(rules.iter().any(|rule| {
+        rule["id"] == replacement
+            && rule["archived_at"].is_null()
+            && rule["definition"]["config"]["notify_on"] == "failure"
+    }));
+
+    let human = offline_human(&data, &["rule", "list", "--watch", &watch_id]);
+    assert!(human.contains("github-status:buildkite/main"));
+    offline_json(
+        &data,
+        &[
+            "rule",
+            "remove",
+            "github-status:buildkite/main",
+            "--watch",
+            &watch_id,
+            "--yes",
+        ],
+    );
+    let rules = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(rules
+        .iter()
+        .any(|rule| { rule["id"] == replacement && !rule["archived_at"].is_null() }));
+}
+
+#[test]
+fn presets_allow_distinct_github_status_contexts_but_not_duplicates() {
+    let data = data_dir();
+    let preset = add_preset(&data, "Statuses");
+    for context in ["buildkite/main", "deploy/preview"] {
+        offline_json(
+            &data,
+            &[
+                "rule",
+                "add",
+                "github-status",
+                "--preset",
+                &preset,
+                "--context",
+                context,
+            ],
+        );
+    }
+    assert_eq!(
+        offline_json(&data, &["rule", "list", "--preset", &preset])["data"]["rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule",
+            "add",
+            "github-status",
+            "--preset",
+            &preset,
+            "--context",
+            "buildkite/main",
+        ])
+        .assert()
+        .code(2);
+
+    offline_json(
+        &data,
+        &[
+            "rule",
+            "remove",
+            "github-status:deploy/preview",
+            "--preset",
+            &preset,
+            "--yes",
+        ],
+    );
+    assert_eq!(
+        offline_json(&data, &["rule", "list", "--preset", &preset])["data"]["rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

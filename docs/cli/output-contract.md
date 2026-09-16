@@ -162,13 +162,22 @@ ID              [dim]preset_rule_01JB…[/dim]
 Alert when started
 ```
 
-Use the name shown by `rule list` in place of the rule ID. `bugbot` is a short
-name for a GitHub check rule. If the same name exists on more than one watch,
+Rule lists and detail views show a copy-pasteable qualified reference. Use it
+anywhere a rule ID is accepted:
+
+```text
+github-check:Cursor Bugbot
+github-status:buildkite/discord-clint-lint-eslint
+buildkite-job:buildkite/main:discord/client:test-linux
+```
+
+`bugbot` remains a short name for a GitHub check rule, and unique unqualified
+names still work. If the same reference or name exists on more than one watch,
 select the watch with its pull request URL:
 
 ```text
 airborne rule show bugbot --watch https://github.com/discord/discord/pull/12345
-airborne rule disable buildkite/discord-admin --watch https://github.com/discord/discord/pull/12345
+airborne rule remove github-status:buildkite/discord-admin --watch https://github.com/discord/discord/pull/12345
 ```
 
 ```text

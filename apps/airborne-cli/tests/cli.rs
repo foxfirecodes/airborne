@@ -63,6 +63,20 @@ fn preset_commands_and_selectors_are_exposed_in_help() {
 }
 
 #[test]
+fn github_status_help_describes_notify_choices() {
+    airborne()
+        .args(["rule", "add", "github-status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--context <CONTEXT>"))
+        .stdout(predicate::str::contains("--notify-on <NOTIFY_ON>"))
+        .stdout(predicate::str::contains("terminal"))
+        .stdout(predicate::str::contains("success"))
+        .stdout(predicate::str::contains("failure"))
+        .stdout(predicate::str::contains("passed").not());
+}
+
+#[test]
 fn rule_add_requires_exactly_one_scope_selector() {
     airborne()
         .args(["rule", "add", "bugbot"])

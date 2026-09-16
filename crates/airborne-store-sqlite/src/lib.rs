@@ -939,12 +939,14 @@ fn parse_subject_kind(value: String) -> std::result::Result<SubjectKind, StoreEr
 fn rule_kind_text(value: RuleKind) -> &'static str {
     match value {
         RuleKind::GitHubCheckCompletes => "github_check_completes",
+        RuleKind::GitHubStatusCompletes => "github_status_completes",
         RuleKind::BuildkiteJobCompletes => "buildkite_job_completes",
     }
 }
 fn parse_rule_kind(value: String) -> std::result::Result<RuleKind, StoreError> {
     match value.as_str() {
         "github_check_completes" => Ok(RuleKind::GitHubCheckCompletes),
+        "github_status_completes" => Ok(RuleKind::GitHubStatusCompletes),
         "buildkite_job_completes" => Ok(RuleKind::BuildkiteJobCompletes),
         _ => Err(store_error("database has an unknown rule kind")),
     }
@@ -3294,7 +3296,7 @@ mod tests {
         assert!(c.execute("INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('b',1,'paused','x','x')", []).is_err());
     }
     #[tokio::test]
-    async fn rule_kind_policy_keeps_bugbot_singleton_and_allows_distinct_buildkite_jobs() {
+    async fn rule_kind_policy_keeps_bugbot_singleton_and_allows_distinct_multi_instance_rules() {
         let store = SqliteStore::memory().unwrap();
         {
             let c = store.connection.lock().unwrap();
@@ -3319,6 +3321,16 @@ mod tests {
         store.add_rule(add(buildkite("lint"))).await.unwrap();
         assert!(matches!(
             store.add_rule(add(buildkite("unit"))).await,
+            Err(StoreError::RuleConflict { .. })
+        ));
+        let status = |context: &str| RuleConfig::GitHubStatusCompletes {
+            context: airborne_core::GitHubStatusContext::new(context).unwrap(),
+            notify_on: airborne_core::GitHubStatusNotifyOn::Terminal,
+        };
+        store.add_rule(add(status("buildkite/main"))).await.unwrap();
+        store.add_rule(add(status("deploy/preview"))).await.unwrap();
+        assert!(matches!(
+            store.add_rule(add(status("buildkite/main"))).await,
             Err(StoreError::RuleConflict { .. })
         ));
         store.add_rule(add(check("bugbot"))).await.unwrap();

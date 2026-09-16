@@ -18,9 +18,10 @@ use airborne_buildkite::{
     parse_public_build_url, BuildSnapshot, BuildkiteApi, BuildkiteError, JobSnapshot,
 };
 use airborne_core::{
-    multi_job_source_identity, AlertIntent, BuildkiteBuildKey, Candidate, CandidateState, Provider,
-    RuleConfig, SourceIdentity, SourceIssueDraft, SourceIssueScope, Subject, SubjectIdentity,
-    SubjectKey, SubjectKind, SubjectMetadataUpdate, Timestamp, VersionedRule,
+    multi_job_source_identity, AlertIntent, BuildkiteBuildKey, Candidate, CandidateState,
+    GitHubStatusNotifyOn, Provider, RuleConfig, SourceIdentity, SourceIssueDraft, SourceIssueScope,
+    Subject, SubjectIdentity, SubjectKey, SubjectKind, SubjectMetadataUpdate, Timestamp,
+    VersionedRule,
 };
 use airborne_github::{
     parse_pull_request_url, CheckRun, CommitStatus, GitHubApi, GitHubError, PullRequestSnapshot,
@@ -138,6 +139,9 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
         let check_indexes = rule_indexes(&request.rules, |config| {
             matches!(config, RuleConfig::GitHubCheckCompletes { .. })
         });
+        let status_indexes = rule_indexes(&request.rules, |config| {
+            matches!(config, RuleConfig::GitHubStatusCompletes { .. })
+        });
         let buildkite_indexes = rule_indexes(&request.rules, |config| {
             matches!(config, RuleConfig::BuildkiteJobCompletes { .. })
         });
@@ -168,7 +172,9 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
             }
         }
 
-        if !buildkite_indexes.is_empty() {
+        if !status_indexes.is_empty() || !buildkite_indexes.is_empty() {
+            let mut dependent_indexes = status_indexes.clone();
+            dependent_indexes.extend(buildkite_indexes.iter().copied());
             match {
                 let _permit = provider_request_semaphore()
                     .acquire_owned()
@@ -179,6 +185,10 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
                     .await
             } {
                 Ok(statuses) => {
+                    for index in status_indexes {
+                        results[index] =
+                            Some(status_candidate(&request, index, &statuses, &snapshot));
+                    }
                     self.poll_buildkite_rules(
                         &request,
                         &snapshot,
@@ -191,7 +201,7 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
                 Err(error) => fill_issues(
                     &mut results,
                     &request.rules,
-                    buildkite_indexes,
+                    dependent_indexes,
                     github_rule_issue(&error, "commit_statuses"),
                 ),
             }
@@ -214,6 +224,79 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
         report.results = results.into_iter().flatten().collect();
         report
     }
+}
+
+fn status_candidate(
+    request: &MonitorRequest,
+    index: usize,
+    statuses: &[CommitStatus],
+    snapshot: &PullRequestSnapshot,
+) -> RulePollResult {
+    let rule = &request.rules[index];
+    let RuleConfig::GitHubStatusCompletes { context, notify_on } = &rule.definition.config else {
+        return issue_result(
+            rule,
+            Provider::GitHub,
+            "invalid_rule",
+            "rule is not a GitHub commit status rule",
+            false,
+        );
+    };
+    let Some(status) = newest_status(statuses, context.as_str()) else {
+        return candidate_result(base_candidate(
+            request,
+            rule,
+            snapshot,
+            CandidateState::NotDetected,
+            None,
+            None,
+            None,
+        ));
+    };
+    // GitHub creates a new status record for every update. Keep the source
+    // stable for this context so one rule/revision cannot alert twice merely
+    // because the provider returned another terminal record.
+    let source_identity = source(&format!("github-status:v1:{}", context.as_str()));
+    let (state, result) = match status.state.as_str() {
+        "pending" => (CandidateState::InProgress, None),
+        "success" => (CandidateState::Completed, Some("success")),
+        "failure" => (CandidateState::Failed, Some("failure")),
+        "error" => (CandidateState::Failed, Some("error")),
+        _ => {
+            return issue_result(
+                rule,
+                Provider::GitHub,
+                "status_state",
+                "GitHub returned an unknown commit status state",
+                false,
+            )
+        }
+    };
+    let should_alert = matches!(
+        (notify_on, result),
+        (GitHubStatusNotifyOn::Terminal, Some(_))
+            | (GitHubStatusNotifyOn::Success, Some("success"))
+            | (GitHubStatusNotifyOn::Failure, Some("failure" | "error"))
+    );
+    candidate_result(Candidate {
+        rule_key: rule.key(),
+        subject_key: request.subject.key.clone(),
+        revision: snapshot.head_revision.clone(),
+        state,
+        source_identity: Some(source_identity.clone()),
+        source_url: safe_https_url(status.target_url.as_deref()),
+        detail: result.map(|value| format!("status: {value}")),
+        alert_intent: should_alert.then(|| AlertIntent::Terminal {
+            source_identity,
+            title: format!("{} finished", context.as_str()),
+            body: format!(
+                "{} reported {}",
+                context.as_str(),
+                result.unwrap_or_default()
+            ),
+        }),
+        observed_at: request.observed_at.clone(),
+    })
 }
 
 impl GitHubPullRequestMonitor {
@@ -702,6 +785,16 @@ fn canonical_github_url(value: Option<&str>) -> Option<String> {
     .then(|| url.into())
 }
 
+fn safe_https_url(value: Option<&str>) -> Option<String> {
+    let url = Url::parse(value?).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.into())
+}
+
 fn canonical_buildkite_build_url(value: Option<&str>, key: &BuildkiteBuildKey) -> Option<String> {
     let value = value?;
     let parsed =
@@ -718,8 +811,8 @@ mod tests {
     use airborne_buildkite::{BuildState, JobState};
     use airborne_core::{
         BuildkiteJobName, BuildkiteNotifyOn, BuildkiteOrganization, BuildkitePipeline,
-        GitHubPullRequestKey, GitHubStatusContext, Revision, Rule, RuleDefinition, RuleId,
-        RuleVersion, Subject, SubjectKey, Timestamp,
+        GitHubPullRequestKey, GitHubStatusContext, GitHubStatusNotifyOn, Revision, Rule,
+        RuleDefinition, RuleId, RuleVersion, Subject, SubjectKey, Timestamp,
     };
 
     struct FakeGitHub {
@@ -880,6 +973,15 @@ mod tests {
             },
         )
     }
+    fn status_rule(id: &str, context: &str, notify_on: GitHubStatusNotifyOn) -> VersionedRule {
+        rule(
+            id,
+            RuleConfig::GitHubStatusCompletes {
+                context: GitHubStatusContext::new(context).unwrap(),
+                notify_on,
+            },
+        )
+    }
     fn request(rules: Vec<VersionedRule>) -> MonitorRequest {
         MonitorRequest {
             subject: subject(),
@@ -945,16 +1047,178 @@ mod tests {
         let report = monitor(github, buildkite)
             .poll(request(vec![
                 check_rule("c"),
+                status_rule("s", "buildkite/test", GitHubStatusNotifyOn::Terminal),
                 build_rule("b1", "test", BuildkiteNotifyOn::Terminal),
                 build_rule("b2", "test", BuildkiteNotifyOn::Passed),
             ]))
             .await;
-        assert_eq!(report.results.len(), 3);
+        assert_eq!(report.results.len(), 4);
         assert!(report.subject_issue.is_none());
         assert_eq!(pr_calls.load(Ordering::SeqCst), 1);
         assert_eq!(check_calls.load(Ordering::SeqCst), 1);
         assert_eq!(status_calls.load(Ordering::SeqCst), 1);
         assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn github_status_lifecycle_and_notify_policy_are_exact() {
+        let cases = [
+            (
+                None,
+                GitHubStatusNotifyOn::Terminal,
+                CandidateState::NotDetected,
+                false,
+            ),
+            (
+                Some("pending"),
+                GitHubStatusNotifyOn::Terminal,
+                CandidateState::InProgress,
+                false,
+            ),
+            (
+                Some("success"),
+                GitHubStatusNotifyOn::Terminal,
+                CandidateState::Completed,
+                true,
+            ),
+            (
+                Some("failure"),
+                GitHubStatusNotifyOn::Terminal,
+                CandidateState::Failed,
+                true,
+            ),
+            (
+                Some("error"),
+                GitHubStatusNotifyOn::Terminal,
+                CandidateState::Failed,
+                true,
+            ),
+            (
+                Some("success"),
+                GitHubStatusNotifyOn::Success,
+                CandidateState::Completed,
+                true,
+            ),
+            (
+                Some("failure"),
+                GitHubStatusNotifyOn::Success,
+                CandidateState::Failed,
+                false,
+            ),
+            (
+                Some("success"),
+                GitHubStatusNotifyOn::Failure,
+                CandidateState::Completed,
+                false,
+            ),
+            (
+                Some("failure"),
+                GitHubStatusNotifyOn::Failure,
+                CandidateState::Failed,
+                true,
+            ),
+            (
+                Some("error"),
+                GitHubStatusNotifyOn::Failure,
+                CandidateState::Failed,
+                true,
+            ),
+        ];
+        for (state, notify_on, expected_state, expected_alert) in cases {
+            let mut github = empty_github();
+            github.statuses = Ok(state
+                .map(|state| {
+                    vec![CommitStatus {
+                        state: state.into(),
+                        ..status()
+                    }]
+                })
+                .unwrap_or_default());
+            let report = monitor(
+                github,
+                FakeBuildkite {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    build: Err("unused".into()),
+                },
+            )
+            .poll(request(vec![status_rule("s", "buildkite/test", notify_on)]))
+            .await;
+            let RulePollResult::Candidate(candidate) = &report.results[0] else {
+                panic!()
+            };
+            assert_eq!(candidate.state, expected_state, "state {state:?}");
+            assert_eq!(
+                candidate.alert_intent.is_some(),
+                expected_alert,
+                "state {state:?}"
+            );
+            if state.is_some() {
+                assert_eq!(
+                    candidate.source_identity.as_ref().unwrap().as_str(),
+                    "github-status:v1:buildkite/test"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn github_status_selection_is_exact_newest_and_unknown_states_are_issues() {
+        let mut github = empty_github();
+        github.statuses = Ok(vec![
+            CommitStatus {
+                id: "2".into(),
+                state: "pending".into(),
+                ..status()
+            },
+            CommitStatus {
+                id: "10".into(),
+                state: "success".into(),
+                ..status()
+            },
+            CommitStatus {
+                id: "99".into(),
+                context: "Buildkite/test".into(),
+                state: "failure".into(),
+                ..status()
+            },
+        ]);
+        let report = monitor(
+            github,
+            FakeBuildkite {
+                calls: Arc::new(AtomicUsize::new(0)),
+                build: Err("unused".into()),
+            },
+        )
+        .poll(request(vec![status_rule(
+            "s",
+            "buildkite/test",
+            GitHubStatusNotifyOn::Terminal,
+        )]))
+        .await;
+        assert!(matches!(
+            &report.results[0],
+            RulePollResult::Candidate(candidate) if candidate.state == CandidateState::Completed
+        ));
+
+        let mut github = empty_github();
+        github.statuses = Ok(vec![CommitStatus {
+            state: "mystery".into(),
+            ..status()
+        }]);
+        let report = monitor(
+            github,
+            FakeBuildkite {
+                calls: Arc::new(AtomicUsize::new(0)),
+                build: Err("unused".into()),
+            },
+        )
+        .poll(request(vec![status_rule(
+            "s",
+            "buildkite/test",
+            GitHubStatusNotifyOn::Terminal,
+        )]))
+        .await;
+        assert!(matches!(report.results[0], RulePollResult::Issue { .. }));
     }
 
     #[tokio::test]

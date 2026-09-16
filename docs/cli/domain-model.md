@@ -140,8 +140,9 @@ PresetRule
 A preset is a reusable rule template for one subject kind, not a watch. Its
 rules have no enabled flag, version, observations, alerts, or lifecycle state.
 Each rule kind owns its count and identity policy. Bugbot permits one rule.
-Buildkite permits multiple jobs, identified by context, organization, pipeline,
-and job name. A preset enforces the same policy as a watch.
+GitHub statuses permit multiple exact contexts. Buildkite permits multiple
+jobs, identified by context, organization, pipeline, and job name. A preset
+enforces the same policy as a watch.
 
 Adding a watch with a preset copies every preset rule into new, enabled watch
 rules at version `1`, in the same transaction as the watch. Applying a preset
@@ -181,13 +182,17 @@ disabled rule also copies its current definition into a new version. Resuming
 a watch does the same for each enabled rule. Disabling, renaming for display,
 pausing a watch, or archiving does not change a version.
 
-Version 1 has two rule kinds:
+Version 1 has three rule kinds:
 
 ```text
 GitHubCheckCompletes
   check_name
   alert_on_start: bool = false
   alert_if_missing_after?: Duration
+
+GitHubStatusCompletes
+  context
+  notify_on: terminal | success | failure
 
 BuildkiteJobCompletes
   github_status_context
@@ -198,6 +203,12 @@ BuildkiteJobCompletes
 ```
 
 The provider-neutral state is not stored in the rule definition.
+
+A GitHub status rule selects the newest commit status whose context matches
+exactly. No match is `not_detected`; `pending` is `in_progress`; `success` is
+`completed`; and `failure` or `error` is `failed`. An unknown provider state is
+a source issue. `terminal` alerts on every known terminal result, `success`
+only on success, and `failure` only on failure or error.
 
 ### 4.5 Candidate
 

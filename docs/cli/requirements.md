@@ -158,6 +158,11 @@ airborne rule add bugbot (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET
   [--alert-on-start] \
   [--alert-if-missing-after <DURATION>]
 
+airborne rule add github-status (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) \
+  --context <EXACT_STATUS_CONTEXT> \
+  [--replace] \
+  [--notify-on terminal|success|failure]
+
 airborne rule add buildkite-job (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) \
   --context <GITHUB_STATUS_CONTEXT> \
   --organization <ORGANIZATION> \
@@ -181,8 +186,9 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
 - `rule add --replace` must archive the current non-archived rule with the same
   instance identity and create the requested rule in one transaction. With no
   matching rule, it must act like a normal add. Past alerts and observations
-  must remain. Bugbot has one fixed instance identity. A Buildkite job's
-  instance identity is its context, organization, pipeline, and job name.
+  must remain. Bugbot has one fixed instance identity. A GitHub status rule's
+  instance identity is its exact context. A Buildkite job's instance identity
+  is its context, organization, pipeline, and job name.
   For a preset target, `--replace` instead replaces that preset definition;
   presets have no rule history to archive.
 - Every `rule add` target is exactly one of `--watch` and `--preset`. A watch
@@ -199,15 +205,23 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
   enabled replacement rules at version `1`, all in that transaction.
   Archived rules retain their alerts and observations.
 - Each rule kind declares its own maximum count. Bugbot permits one live rule
-  per watch or preset. Buildkite jobs permit multiple live rules, but their
-  instance identities must differ. Disabled rules still count toward limits.
+  per watch or preset. GitHub statuses and Buildkite jobs permit multiple live
+  rules, but their instance identities must differ. Disabled rules still count
+  toward limits.
 - A copied rule has no ongoing relationship with its preset. Preset mutations
   affect only future `watch add --preset` and `rule apply` copies.
-- Rule commands must accept a full rule ID or a stable human name. `bugbot`
-  identifies the GitHub check rule on a watch. An exact GitHub check name,
-  Buildkite status context, or Buildkite job name also identifies its rule.
+- Rule commands must accept a full rule ID, a stable qualified reference, or a
+  human name. Qualified references are `github-check:<check-name>`,
+  `github-status:<context>`, and
+  `buildkite-job:<context>:<organization>/<pipeline>:<job-name>`. Literal `%`
+  and `:` characters in components use `%25` and `%3A`; organization and
+  pipeline slashes use `%2F`. `bugbot` identifies the GitHub check rule on a
+  watch. An exact GitHub check name, status context, or Buildkite job name also
+  identifies its rule.
   A name that occurs on more than one watch must fail and tell the user to add
   `--watch`; a GitHub pull request URL is valid there.
+- Human rule lists and detail views must print the qualified reference so it
+  can be copied into `show`, `update`, `enable`, `disable`, or `remove`.
 - Bugbot completion alerts are on by default. Start and missing alerts are off
   by default.
 - `--alert-on-start` enables a start alert and `--no-alert-on-start` disables
@@ -215,9 +229,12 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
 - `--alert-if-missing-after` enables a missing alert after the given positive
   duration. `--no-alert-if-missing-after` disables it. A rule add has no
   missing threshold unless this flag is supplied.
-- Buildkite context, organization, pipeline, and job name must use exact,
-  case-sensitive matching.
+- GitHub status context and Buildkite context, organization, pipeline, and job
+  name must use exact, case-sensitive matching.
 - `--notify-on` must default to `terminal`.
+- For GitHub statuses, `terminal` alerts on `success`, `failure`, or `error`;
+  `success` alerts only on `success`; and `failure` alerts on `failure` or
+  `error`.
 - `rule update` must keep the rule kind fixed, accept the same options as that
   kind's `rule add`, and require at least one changed option.
 - A change to rule matching or alert policy must create a new rule version.

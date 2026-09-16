@@ -13,7 +13,7 @@ they conflict with this directory, this directory wins.
 ## Product decision
 
 Airborne is a local command-line tool that watches pull requests and records
-alerts when selected checks or Buildkite jobs finish. Presets save reusable
+alerts when selected checks, commit statuses, or Buildkite jobs finish. Presets save reusable
 rule definitions; applying one copies those definitions to a watch. A Bugbot
 rule may also alert when its check starts or stays undetected past a configured
 delay. It has no required
