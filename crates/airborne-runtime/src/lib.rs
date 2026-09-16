@@ -88,9 +88,9 @@ pub enum StoreError {
     #[error("{message}")]
     Failed { message: String },
     #[error(
-        "watch {watch_id} already has an active {kind:?} rule ({existing_rule_id}); archive it before adding another"
+        "watch {watch_id} cannot add another {kind:?} rule because it conflicts with {existing_rule_id}"
     )]
-    RuleKindConflict {
+    RuleConflict {
         watch_id: WatchId,
         kind: RuleKind,
         existing_rule_id: RuleId,

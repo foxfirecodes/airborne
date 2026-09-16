@@ -351,6 +351,25 @@ pub enum RuleKind {
     GitHubCheckCompletes,
     BuildkiteJobCompletes,
 }
+impl RuleKind {
+    pub const fn max_instances_per_target(self) -> Option<usize> {
+        match self {
+            Self::GitHubCheckCompletes => Some(1),
+            Self::BuildkiteJobCompletes => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuleInstanceKey {
+    GitHubCheckCompletes,
+    BuildkiteJobCompletes {
+        github_status_context: GitHubStatusContext,
+        expected_organization: BuildkiteOrganization,
+        expected_pipeline: BuildkitePipeline,
+        job_name: BuildkiteJobName,
+    },
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub id: RuleId,
@@ -398,6 +417,23 @@ impl RuleConfig {
             Self::GitHubCheckCompletes { .. } | Self::BuildkiteJobCompletes { .. } => {
                 SubjectKind::GitHubPullRequest
             }
+        }
+    }
+    pub fn instance_key(&self) -> RuleInstanceKey {
+        match self {
+            Self::GitHubCheckCompletes { .. } => RuleInstanceKey::GitHubCheckCompletes,
+            Self::BuildkiteJobCompletes {
+                github_status_context,
+                expected_organization,
+                expected_pipeline,
+                job_name,
+                ..
+            } => RuleInstanceKey::BuildkiteJobCompletes {
+                github_status_context: github_status_context.clone(),
+                expected_organization: expected_organization.clone(),
+                expected_pipeline: expected_pipeline.clone(),
+                job_name: job_name.clone(),
+            },
         }
     }
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -978,6 +1014,32 @@ mod tests {
         assert_eq!(key.repository.owner.as_str(), "acme");
         assert_eq!(key.repository.repository.as_str(), "airborne");
         assert_eq!(key.number.get(), 42);
+    }
+    #[test]
+    fn rule_instance_identity_excludes_alert_policy() {
+        let buildkite = |job: &str, notify_on| RuleConfig::BuildkiteJobCompletes {
+            github_status_context: GitHubStatusContext::new("buildkite/main").unwrap(),
+            expected_organization: BuildkiteOrganization::new("acme").unwrap(),
+            expected_pipeline: BuildkitePipeline::new("app").unwrap(),
+            job_name: BuildkiteJobName::new(job).unwrap(),
+            notify_on,
+        };
+        assert_eq!(
+            buildkite("unit", BuildkiteNotifyOn::Terminal).instance_key(),
+            buildkite("unit", BuildkiteNotifyOn::Passed).instance_key()
+        );
+        assert_ne!(
+            buildkite("unit", BuildkiteNotifyOn::Terminal).instance_key(),
+            buildkite("lint", BuildkiteNotifyOn::Terminal).instance_key()
+        );
+        assert_eq!(
+            RuleKind::GitHubCheckCompletes.max_instances_per_target(),
+            Some(1)
+        );
+        assert_eq!(
+            RuleKind::BuildkiteJobCompletes.max_instances_per_target(),
+            None
+        );
     }
     #[test]
     fn timestamp_serializes_canonical_utc_rfc3339() {

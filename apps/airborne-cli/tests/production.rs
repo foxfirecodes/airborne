@@ -1398,3 +1398,125 @@ fn duplicate_bugbot_rules_require_replace_or_archiving() {
         added_id
     );
 }
+
+#[test]
+fn distinct_buildkite_jobs_share_a_watch_and_replace_only_the_matching_job() {
+    let data = data_dir();
+    let (watch_id, _) = imported_watch_rule(&data);
+    let add = |job: &str, extra: &[&str]| {
+        let mut args = vec![
+            "rule",
+            "add",
+            "buildkite-job",
+            "--watch",
+            &watch_id,
+            "--context",
+            "buildkite/main",
+            "--organization",
+            "acme",
+            "--pipeline",
+            "app",
+            "--job",
+            job,
+        ];
+        args.extend_from_slice(extra);
+        offline_json(&data, &args)
+    };
+    let unit = add("unit", &[])["data"]["id"].as_str().unwrap().to_owned();
+    let lint = add("lint", &[])["data"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(unit, lint);
+
+    let duplicate = airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule",
+            "add",
+            "buildkite-job",
+            "--watch",
+            &watch_id,
+            "--context",
+            "buildkite/main",
+            "--organization",
+            "acme",
+            "--pipeline",
+            "app",
+            "--job",
+            "unit",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(2));
+
+    let replacement = add("unit", &["--replace", "--notify-on", "passed"])["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(replacement, unit);
+    let rules = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(rules
+        .iter()
+        .any(|rule| rule["id"] == lint && rule["archived_at"].is_null()));
+    assert!(rules
+        .iter()
+        .any(|rule| rule["id"] == unit && !rule["archived_at"].is_null()));
+    assert!(rules
+        .iter()
+        .any(|rule| rule["id"] == replacement && rule["archived_at"].is_null()));
+}
+
+#[test]
+fn presets_allow_distinct_buildkite_jobs_but_not_duplicate_instances() {
+    let data = data_dir();
+    let preset = add_preset(&data, "Buildkite");
+    for job in ["unit", "lint"] {
+        offline_json(
+            &data,
+            &[
+                "rule",
+                "add",
+                "buildkite-job",
+                "--preset",
+                &preset,
+                "--context",
+                "buildkite/main",
+                "--organization",
+                "acme",
+                "--pipeline",
+                "app",
+                "--job",
+                job,
+            ],
+        );
+    }
+    assert_eq!(
+        offline_json(&data, &["rule", "list", "--preset", &preset])["data"]["rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args([
+            "rule",
+            "add",
+            "buildkite-job",
+            "--preset",
+            &preset,
+            "--context",
+            "buildkite/main",
+            "--organization",
+            "acme",
+            "--pipeline",
+            "app",
+            "--job",
+            "unit",
+        ])
+        .assert()
+        .code(2);
+}

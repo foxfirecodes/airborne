@@ -325,8 +325,8 @@ Required database constraints include:
 - unique `(rule_id, rule_version, revision)` observation;
 - unique `(rule_id, rule_version, revision, event_kind, source_identity)`
   alert, with a normalized sentinel for a missing source identity;
-- one non-archived rule kind per watch, enforced by a partial unique index or
-  an equivalent transactional constraint;
+- each rule kind's maximum live-instance count and instance identity policy,
+  enforced in an immediate write transaction;
 - no cascading delete from watch or rule into alerts;
 - monotonic schema migration versions.
 
@@ -335,11 +335,13 @@ block Airborne forever. An active runner lease must use renewal. Refresh leases
 must cover only a refresh, not runner sleep, and must renew during long network
 requests. Loss of lease renewal must cancel new work before another commit.
 
-The migration that introduces the rule-kind constraint must retain every legacy
+The v5 migration that introduced the old one-per-kind constraint must retain every legacy
 rule, version, observation, and alert. It must keep the earliest active row in
 each duplicate `(watch_id, kind)` group (creation time, then ID) and archive
 the other rows. A durable repair record must name the surviving and archived
-rule IDs and the deterministic reason. It must be idempotent.
+rule IDs and the deterministic reason. It must be idempotent. The v9 migration
+removes that constraint without deleting rules or preset definitions; the store
+then enforces each kind's instance policy in immediate write transactions.
 
 ### 4.7 `airborne-credentials-macos`
 
@@ -449,12 +451,11 @@ application service owned by runtime or CLI composition; do not let the SQLite
 repository call GitHub.
 
 `PresetRepository` owns preset CRUD, preset-rule CRUD, watch creation from a
-preset, and preset application. `add_rule` must return a typed conflict when a
-non-archived rule of that kind already exists for the watch, including when
-that existing rule is disabled.
-Preset application must check every target slot and either commit all copied
-rules or no copied rules. With `replace`, it must archive conflicting rules and
-create their replacements in that same transaction.
+preset, and preset application. `add_rule` must enforce the kind's live-instance
+limit and reject a duplicate instance, including when that instance is disabled.
+Preset application must check every target instance and either commit all
+copied rules or no copied rules. With `replace`, it must archive matching
+instances and create their replacements in that same transaction.
 Rule updates must distinguish policy set, policy clear, and policy unchanged so
 the CLI can implement explicit start enable/disable and missing-threshold
 set/clear flags without ambiguous optional values.

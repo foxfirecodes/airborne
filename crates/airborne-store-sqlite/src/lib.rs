@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const LATEST_SCHEMA: i64 = 8;
+const LATEST_SCHEMA: i64 = 9;
 
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
@@ -370,7 +370,7 @@ impl SqliteStore {
         }
         Ok(())
     }
-    /// Creates a rule, atomically archiving the current rule of the same kind.
+    /// Creates a rule, atomically archiving the matching rule instance.
     pub async fn replace_rule(&self, draft: NewRule) -> std::result::Result<Rule, StoreError> {
         draft.config.validate().map_err(store_error)?;
         let mut connection = self
@@ -401,13 +401,24 @@ impl SqliteStore {
             _ => {}
         }
 
+        if draft.config.subject_kind() != watch_subject_kind(&transaction, &draft.watch_id)? {
+            return Err(store_error(
+                "rule is not compatible with this watch's subject kind",
+            ));
+        }
+        let existing = matching_live_rule(&transaction, &draft.watch_id, &draft.config)?;
+        if existing.is_none() {
+            ensure_rule_capacity(&transaction, &draft.watch_id, &draft.config, None)?;
+        }
         let at = sql_timestamp(&draft.created_at);
-        transaction
-            .execute(
-                "UPDATE rule SET state='archived',enabled=0,updated_at=?,archived_at=? WHERE watch_id=? AND kind=? AND state='active'",
-                params![at, at, draft.watch_id.as_str(), rule_kind_text(draft.config.kind())],
-            )
-            .map_err(store_error)?;
+        if let Some(existing) = existing {
+            transaction
+                .execute(
+                    "UPDATE rule SET state='archived',enabled=0,updated_at=?,archived_at=? WHERE id=? AND state='active'",
+                    params![at, at, existing.as_str()],
+                )
+                .map_err(store_error)?;
+        }
 
         let id = RuleId::new(uid("rule")).map_err(store_error)?;
         let definition = serde_json::to_string(&draft.config).map_err(store_error)?;
@@ -962,21 +973,76 @@ fn sql_timestamp(value: &Timestamp) -> String {
 fn uid(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
 }
-fn existing_live_rule(
+fn live_rules_of_kind(
     tx: &Transaction<'_>,
     watch_id: &WatchId,
     kind: RuleKind,
+) -> std::result::Result<Vec<(RuleId, RuleConfig)>, StoreError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT r.id,d.definition FROM rule r JOIN rule_definition d ON d.rule_id=r.id AND d.version=r.current_version WHERE r.watch_id=? AND r.kind=? AND r.state != 'archived' ORDER BY r.created_at,r.id",
+        )
+        .map_err(store_error)?;
+    let rows = statement
+        .query_map(params![watch_id.as_str(), rule_kind_text(kind)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(store_error)?
+        .map(|row| {
+            let (id, definition) = row.map_err(store_error)?;
+            Ok((
+                RuleId::new(id).map_err(store_error)?,
+                serde_json::from_str(&definition).map_err(store_error)?,
+            ))
+        })
+        .collect();
+    rows
+}
+
+fn matching_live_rule(
+    tx: &Transaction<'_>,
+    watch_id: &WatchId,
+    config: &RuleConfig,
 ) -> std::result::Result<Option<RuleId>, StoreError> {
-    tx.query_row(
-        "SELECT id FROM rule WHERE watch_id=? AND kind=? AND state != 'archived' ORDER BY created_at,id LIMIT 1",
-        params![watch_id.as_str(), rule_kind_text(kind)],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(store_error)?
-    .map(RuleId::new)
-    .transpose()
-    .map_err(store_error)
+    Ok(live_rules_of_kind(tx, watch_id, config.kind())?
+        .into_iter()
+        .find_map(|(id, existing)| {
+            (existing.instance_key() == config.instance_key()).then_some(id)
+        }))
+}
+
+fn ensure_rule_capacity(
+    tx: &Transaction<'_>,
+    watch_id: &WatchId,
+    config: &RuleConfig,
+    except: Option<&RuleId>,
+) -> std::result::Result<(), StoreError> {
+    let existing = live_rules_of_kind(tx, watch_id, config.kind())?
+        .into_iter()
+        .filter(|(id, _)| except != Some(id))
+        .collect::<Vec<_>>();
+    if let Some((existing_rule_id, _)) = existing
+        .iter()
+        .find(|(_, item)| item.instance_key() == config.instance_key())
+    {
+        return Err(StoreError::RuleConflict {
+            watch_id: watch_id.clone(),
+            kind: config.kind(),
+            existing_rule_id: existing_rule_id.clone(),
+        });
+    }
+    if config
+        .kind()
+        .max_instances_per_target()
+        .is_some_and(|maximum| existing.len() >= maximum)
+    {
+        return Err(StoreError::RuleConflict {
+            watch_id: watch_id.clone(),
+            kind: config.kind(),
+            existing_rule_id: existing[0].0.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn subject_for_watch(connection: &Connection, watch_id: &WatchId) -> Result<Subject> {
@@ -1601,6 +1667,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .map_err(SqliteStoreError::Storage)?;
         tx.commit().map_err(SqliteStoreError::Storage)?;
     }
+    if current <= 8 {
+        let tx = connection
+            .transaction()
+            .map_err(SqliteStoreError::Storage)?;
+        migrate_v9(&tx)?;
+        tx.execute("INSERT INTO schema_migration(version) VALUES (9)", [])
+            .map_err(SqliteStoreError::Storage)?;
+        tx.commit().map_err(SqliteStoreError::Storage)?;
+    }
     Ok(())
 }
 
@@ -1781,6 +1856,26 @@ fn migrate_v8(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v9(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS one_live_rule_kind_per_watch;
+         DROP INDEX IF EXISTS preset_rule_preset;
+         ALTER TABLE preset_rule RENAME TO preset_rule_v8;
+         CREATE TABLE preset_rule (
+           id TEXT PRIMARY KEY,
+           preset_id TEXT NOT NULL REFERENCES preset(id),
+           kind TEXT NOT NULL,
+           definition TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         INSERT INTO preset_rule SELECT id,preset_id,kind,definition,created_at,updated_at FROM preset_rule_v8;
+         DROP TABLE preset_rule_v8;
+         CREATE INDEX preset_rule_preset ON preset_rule(preset_id,created_at,kind);",
+    )
+    .map_err(SqliteStoreError::Storage)
+}
+
 fn read_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Preset> {
     let id: String = row.get(0)?;
     let name: String = row.get(1)?;
@@ -1862,8 +1957,34 @@ fn active_preset_rules(
                 "preset contains a rule for a different subject kind",
             ));
         }
+        ensure_preset_rule_capacity(&rules, &rule.config, Some(&rule.id))?;
     }
     Ok(rules)
+}
+
+fn ensure_preset_rule_capacity(
+    rules: &[PresetRule],
+    config: &RuleConfig,
+    except: Option<&PresetRuleId>,
+) -> std::result::Result<(), StoreError> {
+    let same_kind = rules
+        .iter()
+        .filter(|rule| except != Some(&rule.id) && rule.config.kind() == config.kind())
+        .collect::<Vec<_>>();
+    if same_kind
+        .iter()
+        .any(|rule| rule.config.instance_key() == config.instance_key())
+    {
+        return Err(store_error("preset already has this rule instance"));
+    }
+    if config
+        .kind()
+        .max_instances_per_target()
+        .is_some_and(|maximum| same_kind.len() >= maximum)
+    {
+        return Err(store_error("preset has reached this rule kind's limit"));
+    }
+    Ok(())
 }
 
 fn preset_subject_kind(
@@ -1934,9 +2055,7 @@ impl PresetRepository for SqliteStore {
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(store_error)?;
+        let tx = connection.transaction().map_err(store_error)?;
         let id = PresetId::new(uid("preset")).map_err(store_error)?;
         let at = sql_timestamp(&draft.created_at);
         tx.execute(
@@ -1998,7 +2117,9 @@ impl PresetRepository for SqliteStore {
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
-        let tx = connection.transaction().map_err(store_error)?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
         if tx
             .execute(
                 "UPDATE preset SET name=?,updated_at=? WHERE id=? AND state='active'",
@@ -2059,12 +2180,13 @@ impl PresetRepository for SqliteStore {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
-        active_preset_rules(&tx, &preset_id)?;
+        let existing_rules = active_preset_rules(&tx, &preset_id)?;
         if config.subject_kind() != preset_subject_kind(&tx, &preset_id)? {
             return Err(store_error(
                 "rule is not compatible with this preset's subject kind",
             ));
         }
+        ensure_preset_rule_capacity(&existing_rules, &config, None)?;
         let timestamp = sql_timestamp(&at);
         let id = PresetRuleId::new(uid("preset_rule")).map_err(store_error)?;
         tx.execute("INSERT INTO preset_rule(id,preset_id,kind,definition,created_at,updated_at) VALUES (?,?,?,?,?,?)", params![id.as_str(), preset_id.as_str(), rule_kind_text(config.kind()), serde_json::to_string(&config).map_err(store_error)?, timestamp, timestamp]).map_err(store_error)?;
@@ -2107,12 +2229,13 @@ impl PresetRepository for SqliteStore {
         if parse_rule_kind(kind).map_err(store_error)? != change.config.kind() {
             return Err(store_error("preset rule kind cannot change"));
         }
-        active_preset_rules(&tx, &preset_id)?;
+        let existing_rules = active_preset_rules(&tx, &preset_id)?;
         if change.config.subject_kind() != preset_subject_kind(&tx, &preset_id)? {
             return Err(store_error(
                 "rule is not compatible with this preset's subject kind",
             ));
         }
+        ensure_preset_rule_capacity(&existing_rules, &change.config, Some(&change.id))?;
         if tx
             .execute(
                 "UPDATE preset_rule SET definition=?,updated_at=? WHERE id=?",
@@ -2277,12 +2400,14 @@ impl PresetRepository for SqliteStore {
         }
         let mut conflicts = Vec::new();
         for preset_rule in &preset_rules {
-            if let Some(existing) = existing_live_rule(&tx, &watch_id, preset_rule.config.kind())? {
+            if let Some(existing) = matching_live_rule(&tx, &watch_id, &preset_rule.config)? {
                 conflicts.push(existing);
+            } else {
+                ensure_rule_capacity(&tx, &watch_id, &preset_rule.config, None)?;
             }
         }
         if !replace {
-            if let Some(existing_rule_id) = conflicts.into_iter().next() {
+            if let Some(existing_rule_id) = conflicts.first().cloned() {
                 let kind = tx
                     .query_row(
                         "SELECT kind FROM rule WHERE id=?",
@@ -2290,7 +2415,7 @@ impl PresetRepository for SqliteStore {
                         |row| row.get::<_, String>(0),
                     )
                     .map_err(store_error)?;
-                return Err(StoreError::RuleKindConflict {
+                return Err(StoreError::RuleConflict {
                     watch_id,
                     kind: parse_rule_kind(kind).map_err(store_error)?,
                     existing_rule_id,
@@ -2298,8 +2423,8 @@ impl PresetRepository for SqliteStore {
             }
         }
         if replace {
-            for preset_rule in &preset_rules {
-                tx.execute("UPDATE rule SET state='archived',enabled=0,updated_at=?,archived_at=? WHERE watch_id=? AND kind=? AND state='active'", params![sql_timestamp(&at), sql_timestamp(&at), watch_id.as_str(), rule_kind_text(preset_rule.config.kind())]).map_err(store_error)?;
+            for existing in &conflicts {
+                tx.execute("UPDATE rule SET state='archived',enabled=0,updated_at=?,archived_at=? WHERE id=? AND state='active'", params![sql_timestamp(&at), sql_timestamp(&at), existing.as_str()]).map_err(store_error)?;
             }
         }
         let mut rules = Vec::with_capacity(preset_rules.len());
@@ -2429,28 +2554,11 @@ impl CatalogRepository for SqliteStore {
                 "rule is not compatible with this watch's subject kind",
             ));
         }
-        if let Some(existing_rule_id) =
-            existing_live_rule(&tx, &draft.watch_id, draft.config.kind())?
-        {
-            return Err(StoreError::RuleKindConflict {
-                watch_id: draft.watch_id,
-                kind: draft.config.kind(),
-                existing_rule_id,
-            });
-        }
+        ensure_rule_capacity(&tx, &draft.watch_id, &draft.config, None)?;
         let id = RuleId::new(uid("rule")).map_err(store_error)?;
         let at = sql_timestamp(&draft.created_at);
         let json = serde_json::to_string(&draft.config).map_err(store_error)?;
-        if let Err(error) = tx.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)", params![id.as_str(),draft.watch_id.as_str(),rule_kind_text(draft.config.kind()),draft.enabled,at,at]) {
-            if let Some(existing_rule_id) = existing_live_rule(&tx, &draft.watch_id, draft.config.kind())? {
-                return Err(StoreError::RuleKindConflict {
-                    watch_id: draft.watch_id,
-                    kind: draft.config.kind(),
-                    existing_rule_id,
-                });
-            }
-            return Err(store_error(error));
-        }
+        tx.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES (?,?,?,?,1,'active',?,?)", params![id.as_str(),draft.watch_id.as_str(),rule_kind_text(draft.config.kind()),draft.enabled,at,at]).map_err(store_error)?;
         tx.execute("INSERT INTO rule_definition(rule_id,version,encoding_version,definition,created_at) VALUES (?,1,1,?,?)", params![id.as_str(),json,sql_timestamp(&draft.created_at)]).map_err(store_error)?;
         let rule = tx.query_row("SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=?", [id.as_str()], read_rule).map_err(store_error)?;
         tx.commit().map_err(store_error)?;
@@ -2462,7 +2570,9 @@ impl CatalogRepository for SqliteStore {
             .connection
             .lock()
             .map_err(|_| store_error("database lock failed"))?;
-        let tx = c.transaction().map_err(store_error)?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
         let current: Rule = tx.query_row("SELECT id,watch_id,kind,enabled,current_version,created_at,updated_at,archived_at FROM rule WHERE id=? AND state='active'", [change.id.as_str()], read_rule).optional().map_err(store_error)?.ok_or_else(|| store_error("rule was not found"))?;
         if current.kind != change.config.kind() {
             return Err(store_error("rule kind cannot change"));
@@ -2472,6 +2582,7 @@ impl CatalogRepository for SqliteStore {
                 "rule is not compatible with this watch's subject kind",
             ));
         }
+        ensure_rule_capacity(&tx, &current.watch_id, &change.config, Some(&current.id))?;
         let next = current
             .current_version
             .next()
@@ -2923,7 +3034,7 @@ mod tests {
         let store = SqliteStore::open(file.path()).unwrap();
         {
             let connection = store.connection.lock().unwrap();
-            connection.execute_batch("DROP TABLE preset_rule; DROP TABLE preset; CREATE TABLE preset (id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,description TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,archived_at TEXT); CREATE TABLE preset_rule (id TEXT PRIMARY KEY,preset_id TEXT NOT NULL,kind TEXT NOT NULL,definition TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO preset VALUES ('preset-1','CI',NULL,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL); DELETE FROM schema_migration WHERE version=8;").unwrap();
+            connection.execute_batch("DROP TABLE preset_rule; DROP TABLE preset; CREATE TABLE preset (id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,description TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,archived_at TEXT); CREATE TABLE preset_rule (id TEXT PRIMARY KEY,preset_id TEXT NOT NULL,kind TEXT NOT NULL,definition TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(preset_id,kind)); INSERT INTO preset VALUES ('preset-1','CI',NULL,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL); INSERT INTO preset_rule VALUES ('preset-rule-1','preset-1','github_check_completes','{\"kind\":\"git_hub_check_completes\",\"check_name\":\"Bugbot\"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); DELETE FROM schema_migration WHERE version>=8;").unwrap();
         }
         drop(store);
         let store = SqliteStore::open(file.path()).unwrap();
@@ -2938,6 +3049,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preset.subject_kind, SubjectKind::GitHubPullRequest);
+        assert_eq!(
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM preset_rule", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
     #[tokio::test]
     async fn presets_archive_without_releasing_their_names() {
@@ -3048,7 +3169,7 @@ mod tests {
             store
                 .apply_preset(preset.id.clone(), watch_id.clone(), false, at())
                 .await,
-            Err(StoreError::RuleKindConflict { .. })
+            Err(StoreError::RuleConflict { .. })
         ));
         assert_eq!(
             store
@@ -3172,18 +3293,39 @@ mod tests {
         c.execute("INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('a',1,'active','x','x')", []).unwrap();
         assert!(c.execute("INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('b',1,'paused','x','x')", []).is_err());
     }
-    #[test]
-    fn one_live_rule_kind_keeps_disabled_rows_and_archive_frees_the_kind() {
+    #[tokio::test]
+    async fn rule_kind_policy_keeps_bugbot_singleton_and_allows_distinct_buildkite_jobs() {
         let store = SqliteStore::memory().unwrap();
-        let c = store.connection.lock().unwrap();
-        c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','x','x'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','x','x'); INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('first','w','github_check_completes',0,1,'active','x','x');").unwrap();
-        assert!(c.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('second','w','github_check_completes',1,1,'active','y','y')", []).is_err());
-        c.execute(
-            "UPDATE rule SET state='archived',archived_at='z' WHERE id='first'",
-            [],
-        )
-        .unwrap();
-        c.execute("INSERT INTO rule(id,watch_id,kind,enabled,current_version,state,created_at,updated_at) VALUES ('second','w','github_check_completes',1,1,'active','y','y')", []).unwrap();
+        {
+            let c = store.connection.lock().unwrap();
+            c.execute_batch("INSERT INTO subject(subject_key,kind,canonical_url,title,created_at,updated_at) VALUES ('s','github_pull_request','u','t','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO watch(id,subject_id,state,created_at,updated_at) VALUES ('w',1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").unwrap();
+        }
+        let watch_id = WatchId::new("w").unwrap();
+        let buildkite = |job: &str| RuleConfig::BuildkiteJobCompletes {
+            github_status_context: airborne_core::GitHubStatusContext::new("buildkite/main")
+                .unwrap(),
+            expected_organization: airborne_core::BuildkiteOrganization::new("acme").unwrap(),
+            expected_pipeline: airborne_core::BuildkitePipeline::new("app").unwrap(),
+            job_name: airborne_core::BuildkiteJobName::new(job).unwrap(),
+            notify_on: airborne_core::BuildkiteNotifyOn::Terminal,
+        };
+        let add = |config| NewRule {
+            watch_id: watch_id.clone(),
+            config,
+            enabled: true,
+            created_at: at(),
+        };
+        store.add_rule(add(buildkite("unit"))).await.unwrap();
+        store.add_rule(add(buildkite("lint"))).await.unwrap();
+        assert!(matches!(
+            store.add_rule(add(buildkite("unit"))).await,
+            Err(StoreError::RuleConflict { .. })
+        ));
+        store.add_rule(add(check("bugbot"))).await.unwrap();
+        assert!(matches!(
+            store.add_rule(add(check("another name"))).await,
+            Err(StoreError::RuleConflict { .. })
+        ));
     }
     #[test]
     fn alert_event_kind_is_part_of_the_unique_key() {
@@ -3341,7 +3483,7 @@ mod tests {
         let error = first.err().or(second.err()).unwrap();
         assert!(matches!(
             error,
-            StoreError::RuleKindConflict {
+            StoreError::RuleConflict {
                 watch_id,
                 kind: RuleKind::GitHubCheckCompletes,
                 existing_rule_id,

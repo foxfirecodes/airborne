@@ -139,7 +139,9 @@ PresetRule
 
 A preset is a reusable rule template for one subject kind, not a watch. Its
 rules have no enabled flag, version, observations, alerts, or lifecycle state.
-A preset may have at most one rule of each kind.
+Each rule kind owns its count and identity policy. Bugbot permits one rule.
+Buildkite permits multiple jobs, identified by context, organization, pipeline,
+and job name. A preset enforces the same policy as a watch.
 
 Adding a watch with a preset copies every preset rule into new, enabled watch
 rules at version `1`, in the same transaction as the watch. Applying a preset
@@ -169,9 +171,9 @@ RuleDefinition
   created_at
 ```
 
-There may be at most one non-archived rule of a given kind for a watch.
-Disabled rules count as non-archived and occupy the kind slot. Archiving a rule
-frees it. The store must enforce this invariant, not merely the CLI.
+Each rule kind declares a live-instance limit and an identity. Disabled rules
+still count. Archiving a rule frees its instance. The store must enforce these
+rules, not merely the CLI.
 
 Rule definitions are append-only. Updating a match field or alert policy adds
 a definition and increments `current_version` in one transaction. Enabling a

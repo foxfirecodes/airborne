@@ -178,9 +178,11 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
 ```
 
 - The default Bugbot check name must be `Cursor Bugbot`.
-- `rule add --replace` must archive the current non-archived rule of the same
-  kind and create the requested rule in one transaction. With no current rule,
-  it must act like a normal add. Past alerts and observations must remain.
+- `rule add --replace` must archive the current non-archived rule with the same
+  instance identity and create the requested rule in one transaction. With no
+  matching rule, it must act like a normal add. Past alerts and observations
+  must remain. Bugbot has one fixed instance identity. A Buildkite job's
+  instance identity is its context, organization, pipeline, and job name.
   For a preset target, `--replace` instead replaces that preset definition;
   presets have no rule history to archive.
 - Every `rule add` target is exactly one of `--watch` and `--preset`. A watch
@@ -192,10 +194,13 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
   Removing a preset rule removes that definition; removing a watch rule
   archives it.
 - `rule apply` copies every preset rule into the named watch in one transaction.
-  Without `--replace`, any occupied same-kind slot is a conflict and no rules
-  are copied. With `--replace`, it archives each conflicting watch rule and
-  creates enabled replacement rules at version `1`, all in that transaction.
+  Without `--replace`, any matching instance is a conflict and no rules are
+  copied. With `--replace`, it archives each matching watch rule and creates
+  enabled replacement rules at version `1`, all in that transaction.
   Archived rules retain their alerts and observations.
+- Each rule kind declares its own maximum count. Bugbot permits one live rule
+  per watch or preset. Buildkite jobs permit multiple live rules, but their
+  instance identities must differ. Disabled rules still count toward limits.
 - A copied rule has no ongoing relationship with its preset. Preset mutations
   affect only future `watch add --preset` and `rule apply` copies.
 - Rule commands must accept a full rule ID or a stable human name. `bugbot`
@@ -220,9 +225,9 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
   result becomes a baseline, so time spent disabled cannot cause a late alert.
 - Disabling a rule must retain its history and current version.
 - `rule remove` must archive the rule and retain its alerts and observations.
-- A watch may have at most one non-archived rule of each rule kind. Disabled
-  rules still occupy that slot; archiving a rule frees it. Adding a duplicate
-  must fail with a conflict that identifies the existing rule.
+- A watch must enforce each rule kind's instance limit and identity policy.
+  Disabled rules still count; archiving a rule frees its instance. Adding a
+  duplicate instance or exceeding a kind's limit must identify the conflict.
 
 The CLI does not require a separate pipeline-mapping record. A Buildkite rule
 contains the full expected context and pipeline identity. This removes a UI
@@ -535,8 +540,8 @@ Airborne version 1 is complete only when all of these statements are true:
 4. One source failure cannot block valid results from another source or watch.
 5. Two Buildkite rules for one build cause one Buildkite request per refresh.
 6. Repeated polls and process restarts cannot create duplicate alerts. A watch
-   cannot retain two non-archived rules of the same kind, including after
-   upgrade repair.
+   cannot retain duplicate instances or exceed a rule kind's live-instance
+   limit.
 7. Credentials never appear in stdout, stderr, logs, snapshots, fixtures, the
    database, or crash output.
 8. Database migration, interrupted-write, corrupt-input, and concurrent-process

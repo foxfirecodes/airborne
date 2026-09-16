@@ -269,7 +269,7 @@ enum RuleSub {
             help = "Watch that receives the copied rules"
         )]
         watch: String,
-        #[arg(long, help = "Replace same-kind rules already on the watch")]
+        #[arg(long, help = "Replace matching rule instances already on the watch")]
         replace: bool,
     },
     /// Archive a rule.
@@ -1993,7 +1993,7 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                     .await
                     .map_err(store_err)?
                     .into_iter()
-                    .find(|rule| rule.config.kind() == config.kind());
+                    .find(|rule| rule.config.instance_key() == config.instance_key());
                 if existing.is_some() && !replace {
                     return Err(Error::input(format!(
                         "this preset already has a {} rule; pass --replace to replace it",
@@ -2019,17 +2019,20 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                 &target_watch.expect("clap requires --watch or --preset"),
             )?;
             if let Some(existing) = store
-                .list_rules(Some(&watch_id))
+                .list_rule_views(Some(&watch_id))
                 .map_err(|e| Error::fail(e.to_string()))?
                 .into_iter()
-                .find(|rule| rule.kind == config.kind() && rule.archived_at.is_none())
+                .find(|view| {
+                    view.rule.archived_at.is_none()
+                        && view.definition.config.instance_key() == config.instance_key()
+                })
             {
                 if !replace {
                     return Err(Error::input(format!(
                         "this watch already has a {} rule ({}){}; pass --replace to replace it",
                         rule_kind_name(config.kind()),
-                        existing.id,
-                        if existing.enabled {
+                        existing.rule.id,
+                        if existing.rule.enabled {
                             ""
                         } else {
                             ", currently disabled"
@@ -2780,12 +2783,12 @@ fn store_err(e: airborne_runtime::StoreError) -> Error {
 }
 fn rule_add_err(e: airborne_runtime::StoreError) -> Error {
     match e {
-        airborne_runtime::StoreError::RuleKindConflict {
+        airborne_runtime::StoreError::RuleConflict {
             kind,
             existing_rule_id,
             ..
         } => Error::input(format!(
-            "this watch already has a {} rule ({existing_rule_id}); archive it before adding a replacement",
+            "this watch has a conflicting {} rule ({existing_rule_id}); pass --replace to replace it",
             rule_kind_name(kind),
         )),
         error @ airborne_runtime::StoreError::Failed { .. } => Error::fail(error.to_string()),
