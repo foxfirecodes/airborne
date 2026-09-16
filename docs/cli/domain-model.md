@@ -139,10 +139,10 @@ PresetRule
 
 A preset is a reusable rule template for one subject kind, not a watch. Its
 rules have no enabled flag, version, observations, alerts, or lifecycle state.
-Each rule kind owns its count and identity policy. Bugbot permits one rule.
-GitHub statuses permit multiple exact contexts. Buildkite permits multiple
-jobs, identified by context, organization, pipeline, and job name. A preset
-enforces the same policy as a watch.
+Each rule kind owns its count and identity policy. Bugbot and PR-ready each
+permit one rule. GitHub statuses permit multiple exact contexts. Buildkite
+permits multiple jobs, identified by context, organization, pipeline, and job
+name. A preset enforces the same policy as a watch.
 
 Adding a watch with a preset copies every preset rule into new, enabled watch
 rules at version `1`, in the same transaction as the watch. Applying a preset
@@ -182,7 +182,7 @@ disabled rule also copies its current definition into a new version. Resuming
 a watch does the same for each enabled rule. Disabling, renaming for display,
 pausing a watch, or archiving does not change a version.
 
-Version 1 has three rule kinds:
+Version 1 has four rule kinds:
 
 ```text
 GitHubCheckCompletes
@@ -193,6 +193,8 @@ GitHubCheckCompletes
 GitHubStatusCompletes
   context
   notify_on: terminal | success | failure
+
+GitHubPullRequestReady
 
 BuildkiteJobCompletes
   github_status_context
@@ -209,6 +211,11 @@ exactly. No match is `not_detected`; `pending` is `in_progress`; `success` is
 `completed`; and `failure` or `error` is `failed`. An unknown provider state is
 a source issue. `terminal` alerts on every known terminal result, `success`
 only on success, and `failure` only on failure or error.
+
+A PR-ready rule reads the `draft` field from the pull request snapshot. Draft
+is `in_progress`; ready for review is `completed`. Its source identity stays
+stable for the rule and revision, and only the ready state carries a terminal
+alert intent.
 
 ### 4.5 Candidate
 

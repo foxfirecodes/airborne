@@ -940,6 +940,7 @@ fn rule_kind_text(value: RuleKind) -> &'static str {
     match value {
         RuleKind::GitHubCheckCompletes => "github_check_completes",
         RuleKind::GitHubStatusCompletes => "github_status_completes",
+        RuleKind::GitHubPullRequestReady => "github_pull_request_ready",
         RuleKind::BuildkiteJobCompletes => "buildkite_job_completes",
     }
 }
@@ -947,6 +948,7 @@ fn parse_rule_kind(value: String) -> std::result::Result<RuleKind, StoreError> {
     match value.as_str() {
         "github_check_completes" => Ok(RuleKind::GitHubCheckCompletes),
         "github_status_completes" => Ok(RuleKind::GitHubStatusCompletes),
+        "github_pull_request_ready" => Ok(RuleKind::GitHubPullRequestReady),
         "buildkite_job_completes" => Ok(RuleKind::BuildkiteJobCompletes),
         _ => Err(store_error("database has an unknown rule kind")),
     }
@@ -3331,6 +3333,16 @@ mod tests {
         store.add_rule(add(status("deploy/preview"))).await.unwrap();
         assert!(matches!(
             store.add_rule(add(status("buildkite/main"))).await,
+            Err(StoreError::RuleConflict { .. })
+        ));
+        store
+            .add_rule(add(RuleConfig::GitHubPullRequestReady))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .add_rule(add(RuleConfig::GitHubPullRequestReady))
+                .await,
             Err(StoreError::RuleConflict { .. })
         ));
         store.add_rule(add(check("bugbot"))).await.unwrap();

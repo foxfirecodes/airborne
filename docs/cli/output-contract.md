@@ -167,6 +167,7 @@ anywhere a rule ID is accepted:
 
 ```text
 github-check:Cursor Bugbot
+pr-ready
 github-status:buildkite/discord-clint-lint-eslint
 buildkite-job:buildkite/main:discord/client:test-linux
 ```

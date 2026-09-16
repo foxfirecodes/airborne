@@ -158,6 +158,9 @@ airborne rule add bugbot (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET
   [--alert-on-start] \
   [--alert-if-missing-after <DURATION>]
 
+airborne rule add pr-ready (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) \
+  [--replace]
+
 airborne rule add github-status (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) \
   --context <EXACT_STATUS_CONTEXT> \
   [--replace] \
@@ -186,9 +189,9 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
 - `rule add --replace` must archive the current non-archived rule with the same
   instance identity and create the requested rule in one transaction. With no
   matching rule, it must act like a normal add. Past alerts and observations
-  must remain. Bugbot has one fixed instance identity. A GitHub status rule's
-  instance identity is its exact context. A Buildkite job's instance identity
-  is its context, organization, pipeline, and job name.
+  must remain. Bugbot and PR-ready each have one fixed instance identity. A
+  GitHub status rule's instance identity is its exact context. A Buildkite
+  job's instance identity is its context, organization, pipeline, and job name.
   For a preset target, `--replace` instead replaces that preset definition;
   presets have no rule history to archive.
 - Every `rule add` target is exactly one of `--watch` and `--preset`. A watch
@@ -204,14 +207,15 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
   copied. With `--replace`, it archives each matching watch rule and creates
   enabled replacement rules at version `1`, all in that transaction.
   Archived rules retain their alerts and observations.
-- Each rule kind declares its own maximum count. Bugbot permits one live rule
-  per watch or preset. GitHub statuses and Buildkite jobs permit multiple live
-  rules, but their instance identities must differ. Disabled rules still count
-  toward limits.
+- Each rule kind declares its own maximum count. Bugbot and PR-ready each
+  permit one live rule per watch or preset. GitHub statuses and Buildkite jobs
+  permit multiple live rules, but their instance identities must differ.
+  Disabled rules still count toward limits.
 - A copied rule has no ongoing relationship with its preset. Preset mutations
   affect only future `watch add --preset` and `rule apply` copies.
 - Rule commands must accept a full rule ID, a stable qualified reference, or a
-  human name. Qualified references are `github-check:<check-name>`,
+  human name. Qualified references are `pr-ready`,
+  `github-check:<check-name>`,
   `github-status:<context>`, and
   `buildkite-job:<context>:<organization>/<pipeline>:<job-name>`. Literal `%`
   and `:` characters in components use `%25` and `%3A`; organization and
@@ -224,6 +228,10 @@ airborne rule apply --preset <PRESET_ID_OR_NAME> --watch <WATCH_ID_OR_GITHUB_PR_
   can be copied into `show`, `update`, `enable`, `disable`, or `remove`.
 - Bugbot completion alerts are on by default. Start and missing alerts are off
   by default.
+- A PR-ready rule uses the pull request metadata already fetched on every poll.
+  Draft is `in_progress`; ready for review is `completed`. It emits a terminal
+  alert when a previously baselined draft PR becomes ready and makes no extra
+  provider request.
 - `--alert-on-start` enables a start alert and `--no-alert-on-start` disables
   it. `rule update` must support both so a user can make an explicit choice.
 - `--alert-if-missing-after` enables a missing alert after the given positive

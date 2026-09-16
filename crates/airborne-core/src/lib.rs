@@ -350,12 +350,13 @@ pub struct Watch {
 pub enum RuleKind {
     GitHubCheckCompletes,
     GitHubStatusCompletes,
+    GitHubPullRequestReady,
     BuildkiteJobCompletes,
 }
 impl RuleKind {
     pub const fn max_instances_per_target(self) -> Option<usize> {
         match self {
-            Self::GitHubCheckCompletes => Some(1),
+            Self::GitHubCheckCompletes | Self::GitHubPullRequestReady => Some(1),
             Self::GitHubStatusCompletes | Self::BuildkiteJobCompletes => None,
         }
     }
@@ -364,6 +365,7 @@ impl RuleKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleInstanceKey {
     GitHubCheckCompletes,
+    GitHubPullRequestReady,
     GitHubStatusCompletes {
         context: GitHubStatusContext,
     },
@@ -412,6 +414,7 @@ pub enum RuleConfig {
         context: GitHubStatusContext,
         notify_on: GitHubStatusNotifyOn,
     },
+    GitHubPullRequestReady,
     BuildkiteJobCompletes {
         github_status_context: GitHubStatusContext,
         expected_organization: BuildkiteOrganization,
@@ -425,6 +428,7 @@ impl RuleConfig {
         match self {
             Self::GitHubCheckCompletes { .. } => RuleKind::GitHubCheckCompletes,
             Self::GitHubStatusCompletes { .. } => RuleKind::GitHubStatusCompletes,
+            Self::GitHubPullRequestReady => RuleKind::GitHubPullRequestReady,
             Self::BuildkiteJobCompletes { .. } => RuleKind::BuildkiteJobCompletes,
         }
     }
@@ -432,6 +436,7 @@ impl RuleConfig {
         match self {
             Self::GitHubCheckCompletes { .. }
             | Self::GitHubStatusCompletes { .. }
+            | Self::GitHubPullRequestReady
             | Self::BuildkiteJobCompletes { .. } => SubjectKind::GitHubPullRequest,
         }
     }
@@ -441,6 +446,7 @@ impl RuleConfig {
             Self::GitHubStatusCompletes { context, .. } => RuleInstanceKey::GitHubStatusCompletes {
                 context: context.clone(),
             },
+            Self::GitHubPullRequestReady => RuleInstanceKey::GitHubPullRequestReady,
             Self::BuildkiteJobCompletes {
                 github_status_context,
                 expected_organization,
@@ -1065,6 +1071,10 @@ mod tests {
         );
         assert_eq!(
             RuleKind::GitHubCheckCompletes.max_instances_per_target(),
+            Some(1)
+        );
+        assert_eq!(
+            RuleKind::GitHubPullRequestReady.max_instances_per_target(),
             Some(1)
         );
         assert_eq!(

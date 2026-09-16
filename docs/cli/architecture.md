@@ -206,6 +206,7 @@ Fetch-plan rules:
 - Fetch the PR once.
 - Fetch check runs only when a check rule needs them.
 - Fetch commit statuses only when a GitHub status or Buildkite rule needs them.
+- Evaluate PR-ready rules from the pull request snapshot without another call.
 - Fetch each derived Buildkite build once.
 - Do not let a failed check-run request suppress status/Buildkite work or the
   reverse.

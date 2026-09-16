@@ -77,6 +77,23 @@ fn github_status_help_describes_notify_choices() {
 }
 
 #[test]
+fn pr_ready_help_describes_the_draft_transition() {
+    airborne()
+        .args(["rule", "add", "pr-ready", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Alert when a draft pull request becomes ready for review",
+        ))
+        .stdout(predicate::str::contains(
+            "(--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>)",
+        ))
+        .stdout(predicate::str::contains("--watch"))
+        .stdout(predicate::str::contains("--preset"))
+        .stdout(predicate::str::contains("--replace"));
+}
+
+#[test]
 fn rule_add_requires_exactly_one_scope_selector() {
     airborne()
         .args(["rule", "add", "bugbot"])

@@ -1630,6 +1630,49 @@ fn distinct_github_statuses_share_a_watch_and_replace_only_the_matching_context(
 }
 
 #[test]
+fn pr_ready_is_a_singleton_with_a_copyable_reference() {
+    let data = data_dir();
+    let (watch_id, _) = imported_watch_rule(&data);
+    let added = offline_json(&data, &["rule", "add", "pr-ready", "--watch", &watch_id]);
+    let original = added["data"]["id"].as_str().unwrap().to_owned();
+    let shown = offline_json(&data, &["rule", "show", "pr-ready", "--watch", &watch_id]);
+    assert_eq!(
+        shown["data"]["definition"]["config"]["kind"],
+        "git_hub_pull_request_ready"
+    );
+    airborne()
+        .args(["--data-dir"])
+        .arg(data.path())
+        .args(["rule", "add", "pr-ready", "--watch", &watch_id])
+        .assert()
+        .code(2);
+
+    let replacement = offline_json(
+        &data,
+        &["rule", "add", "pr-ready", "--watch", &watch_id, "--replace"],
+    )["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(replacement, original);
+    let human = offline_human(&data, &["rule", "show", "pr-ready", "--watch", &watch_id]);
+    assert!(human.contains("Reference       pr-ready"));
+    assert!(human.contains("Completes when   pull request leaves draft"));
+
+    offline_json(
+        &data,
+        &["rule", "remove", "pr-ready", "--watch", &watch_id, "--yes"],
+    );
+    let rules = offline_json(&data, &["rule", "list", "--all"])["data"]["rules"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(rules
+        .iter()
+        .any(|rule| { rule["id"] == replacement && !rule["archived_at"].is_null() }));
+}
+
+#[test]
 fn presets_allow_distinct_github_status_contexts_but_not_duplicates() {
     let data = data_dir();
     let preset = add_preset(&data, "Statuses");

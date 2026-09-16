@@ -139,6 +139,9 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
         let check_indexes = rule_indexes(&request.rules, |config| {
             matches!(config, RuleConfig::GitHubCheckCompletes { .. })
         });
+        let ready_indexes = rule_indexes(&request.rules, |config| {
+            matches!(config, RuleConfig::GitHubPullRequestReady)
+        });
         let status_indexes = rule_indexes(&request.rules, |config| {
             matches!(config, RuleConfig::GitHubStatusCompletes { .. })
         });
@@ -147,6 +150,10 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
         });
         let mut results: Vec<Option<RulePollResult>> =
             (0..request.rules.len()).map(|_| None).collect();
+
+        for index in ready_indexes {
+            results[index] = Some(ready_candidate(&request, index, &snapshot));
+        }
 
         if !check_indexes.is_empty() {
             match {
@@ -224,6 +231,48 @@ impl SubjectMonitor for GitHubPullRequestMonitor {
         report.results = results.into_iter().flatten().collect();
         report
     }
+}
+
+fn ready_candidate(
+    request: &MonitorRequest,
+    index: usize,
+    snapshot: &PullRequestSnapshot,
+) -> RulePollResult {
+    let rule = &request.rules[index];
+    if !matches!(rule.definition.config, RuleConfig::GitHubPullRequestReady) {
+        return issue_result(
+            rule,
+            Provider::GitHub,
+            "invalid_rule",
+            "rule is not a pull request ready rule",
+            false,
+        );
+    }
+    let source_identity = source("github-pr-ready:v1");
+    let state = if snapshot.draft {
+        CandidateState::InProgress
+    } else {
+        CandidateState::Completed
+    };
+    candidate_result(Candidate {
+        rule_key: rule.key(),
+        subject_key: request.subject.key.clone(),
+        revision: snapshot.head_revision.clone(),
+        state,
+        source_identity: Some(source_identity.clone()),
+        source_url: None,
+        detail: Some(if snapshot.draft {
+            "pull request is a draft".into()
+        } else {
+            "pull request is ready for review".into()
+        }),
+        alert_intent: (!snapshot.draft).then(|| AlertIntent::Terminal {
+            source_identity,
+            title: "Pull request is ready for review".into(),
+            body: format!("{} is no longer a draft", snapshot.title),
+        }),
+        observed_at: request.observed_at.clone(),
+    })
 }
 
 fn status_candidate(
@@ -821,6 +870,7 @@ mod tests {
         status_calls: Arc<AtomicUsize>,
         checks: Result<Vec<CheckRun>, GitHubError>,
         statuses: Result<Vec<CommitStatus>, GitHubError>,
+        draft: bool,
     }
     #[async_trait]
     impl GitHubApi for FakeGitHub {
@@ -832,6 +882,7 @@ mod tests {
             Ok(PullRequestSnapshot {
                 title: "PR".into(),
                 head_revision: Revision::new("a".to_owned()).unwrap(),
+                draft: self.draft,
             })
         }
         async fn check_runs(
@@ -875,6 +926,7 @@ mod tests {
             Ok(PullRequestSnapshot {
                 title: "PR".into(),
                 head_revision: Revision::new("a").unwrap(),
+                draft: false,
             })
         }
         async fn check_runs(
@@ -1008,6 +1060,7 @@ mod tests {
             status_calls: Arc::new(AtomicUsize::new(0)),
             checks: Ok(vec![]),
             statuses: Ok(vec![]),
+            draft: false,
         }
     }
     fn build(jobs: Vec<JobSnapshot>, state: BuildState, finished: bool) -> BuildSnapshot {
@@ -1058,6 +1111,46 @@ mod tests {
         assert_eq!(check_calls.load(Ordering::SeqCst), 1);
         assert_eq!(status_calls.load(Ordering::SeqCst), 1);
         assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_ready_uses_pull_request_metadata_without_an_extra_fetch() {
+        for (draft, expected_state, expected_alert) in [
+            (true, CandidateState::InProgress, false),
+            (false, CandidateState::Completed, true),
+        ] {
+            let mut github = empty_github();
+            github.draft = draft;
+            let check_calls = github.check_calls.clone();
+            let status_calls = github.status_calls.clone();
+            let report = monitor(
+                github,
+                FakeBuildkite {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    build: Err("unused".into()),
+                },
+            )
+            .poll(request(vec![rule(
+                "ready",
+                RuleConfig::GitHubPullRequestReady,
+            )]))
+            .await;
+            let RulePollResult::Candidate(candidate) = &report.results[0] else {
+                panic!()
+            };
+            assert_eq!(candidate.state, expected_state);
+            assert_eq!(candidate.alert_intent.is_some(), expected_alert);
+            assert_eq!(
+                candidate.detail.as_deref(),
+                Some(if draft {
+                    "pull request is a draft"
+                } else {
+                    "pull request is ready for review"
+                })
+            );
+            assert_eq!(check_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(status_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

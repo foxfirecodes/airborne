@@ -29,6 +29,7 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub struct PullRequestSnapshot {
     pub title: String,
     pub head_revision: Revision,
+    pub draft: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -473,6 +474,7 @@ fn next_link(header: Option<&str>) -> Option<String> {
 #[derive(Deserialize)]
 struct PullRequestPayload {
     title: String,
+    draft: bool,
     head: HeadPayload,
 }
 #[derive(Deserialize)]
@@ -526,6 +528,7 @@ fn decode_pull_request(value: PullRequestPayload) -> Result<PullRequestSnapshot,
     }
     Ok(PullRequestSnapshot {
         title: value.title,
+        draft: value.draft,
         head_revision: Revision::new(value.head.sha).map_err(|_| {
             GitHubError::ProviderResponse {
                 message: "pull request head SHA is missing".into(),
@@ -602,6 +605,7 @@ mod tests {
     fn captured_payloads_decode() {
         let pull = decode_pull_request(serde_json::from_str(PR).unwrap()).unwrap();
         assert_eq!(pull.title, "Example pull request");
+        assert!(!pull.draft);
         let checks = decode_check_runs(serde_json::from_str(CHECKS).unwrap()).unwrap();
         assert_eq!(checks[0].id, "101");
         let statuses = decode_statuses(serde_json::from_str(STATUSES).unwrap()).unwrap();

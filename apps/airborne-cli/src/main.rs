@@ -295,6 +295,17 @@ enum RuleSub {
 }
 #[derive(Subcommand)]
 enum RuleAdd {
+    /// Alert when a draft pull request becomes ready for review.
+    #[command(
+        name = "pr-ready",
+        override_usage = "airborne rule add pr-ready (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) [OPTIONS]"
+    )]
+    PrReady {
+        #[command(flatten)]
+        target: RuleAddTarget,
+        #[arg(long, help = "Replace the current PR-ready rule, if any")]
+        replace: bool,
+    },
     /// Alert when Cursor Bugbot completes.
     #[command(
         override_usage = "airborne rule add bugbot (--watch <WATCH_ID_OR_GITHUB_PR_URL> | --preset <PRESET_ID_OR_NAME>) [OPTIONS]"
@@ -759,6 +770,7 @@ fn rule_name(rule: &Value) -> String {
         &rule["config"]
     };
     match text(config, "kind") {
+        "git_hub_pull_request_ready" => "PR ready".to_owned(),
         "git_hub_check_completes" => text(config, "check_name").to_owned(),
         "git_hub_status_completes" => {
             format!("GitHub status · {}", text(config, "context"))
@@ -781,6 +793,7 @@ fn key_component(value: &str, escape_slash: bool) -> String {
 }
 fn config_rule_reference(config: &RuleConfig) -> String {
     match config {
+        RuleConfig::GitHubPullRequestReady => "pr-ready".into(),
         RuleConfig::GitHubCheckCompletes { check_name, .. } => {
             format!("github-check:{}", key_component(check_name, false))
         }
@@ -809,6 +822,7 @@ fn rule_reference(rule: &Value) -> String {
         &rule["config"]
     };
     match text(config, "kind") {
+        "git_hub_pull_request_ready" => "pr-ready".into(),
         "git_hub_check_completes" => format!(
             "github-check:{}",
             key_component(text(config, "check_name"), false)
@@ -1290,6 +1304,9 @@ fn render_rule_show(r: &Value, color: bool) -> String {
     ];
     let config = &r["definition"]["config"];
     match text(config, "kind") {
+        "git_hub_pull_request_ready" => {
+            out.push("Completes when   pull request leaves draft".into());
+        }
         "git_hub_check_completes" => out.push(format!("Check name       {check}")),
         "git_hub_status_completes" => {
             out.push(format!("Context          {}", text(config, "context")));
@@ -1595,6 +1612,7 @@ fn preset_rule_matches(config: &RuleConfig, value: &str) -> bool {
         return true;
     }
     match config {
+        RuleConfig::GitHubPullRequestReady => value.eq_ignore_ascii_case("pr-ready"),
         RuleConfig::GitHubCheckCompletes { check_name, .. } => {
             value == check_name || value.eq_ignore_ascii_case("bugbot")
         }
@@ -1676,6 +1694,7 @@ fn resolve_rule_reference(
         .into_iter()
         .filter(|rule| match &rule.definition.config {
             config if value == config_rule_reference(config) => true,
+            RuleConfig::GitHubPullRequestReady => value.eq_ignore_ascii_case("pr-ready"),
             RuleConfig::GitHubCheckCompletes { check_name, .. } => {
                 value == check_name || value.eq_ignore_ascii_case("bugbot")
             }
@@ -2074,6 +2093,9 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
     match cmd {
         RuleSub::Add { kind } => {
             let (target, config, replace) = match kind {
+                RuleAdd::PrReady { target, replace } => {
+                    (target, RuleConfig::GitHubPullRequestReady, replace)
+                }
                 RuleAdd::Bugbot {
                     target,
                     replace,
@@ -2392,6 +2414,22 @@ async fn rule(cmd: RuleSub, store: &Arc<SqliteStore>, out: &Out) -> Result<(), E
                             GitHubStatusNotifyOn::Failure => UpdateNotify::Failure,
                         }),
                     )?
+                }
+                RuleConfig::GitHubPullRequestReady => {
+                    if update.check_name.is_some()
+                        || update.context.is_some()
+                        || update.organization.is_some()
+                        || update.pipeline.is_some()
+                        || update.job.is_some()
+                        || update.notify_on.is_some()
+                        || update.alert_on_start
+                        || update.no_alert_on_start
+                        || update.alert_if_missing_after.is_some()
+                        || update.no_alert_if_missing_after
+                    {
+                        return Err(Error::input("a PR-ready rule has no update options"));
+                    }
+                    RuleConfig::GitHubPullRequestReady
                 }
             };
             if let Some(rule) = preset_rule {
@@ -2982,6 +3020,7 @@ fn rule_kind_name(kind: airborne_core::RuleKind) -> &'static str {
     match kind {
         airborne_core::RuleKind::GitHubCheckCompletes => "Bugbot",
         airborne_core::RuleKind::GitHubStatusCompletes => "GitHub status",
+        airborne_core::RuleKind::GitHubPullRequestReady => "PR ready",
         airborne_core::RuleKind::BuildkiteJobCompletes => "Buildkite job",
     }
 }
